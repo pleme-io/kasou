@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use block2::RcBlock;
+use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -58,34 +59,35 @@ impl std::fmt::Display for VmState {
 
 /// Wrapper to make `Retained<VZVirtualMachine>` `Send`.
 ///
-/// SAFETY: All `VZVirtualMachine` interactions are dispatched to its serial
-/// queue via `exec_sync`/`exec_async`. The wrapper itself is only moved
-/// between tokio tasks — never accessed concurrently without queue serialization.
+/// SAFETY: All `VZVirtualMachine` interactions happen via the framework's
+/// dispatch queue. The wrapper is only moved between threads — the framework
+/// handles thread safety internally.
 struct SendVm(Retained<VZVirtualMachine>);
 unsafe impl Send for SendVm {}
 
 /// Handle to a virtual machine.
 ///
-/// Owns the `VZVirtualMachine` instance and its delegate. All VM operations
-/// use the VM's associated dispatch queue for thread safety. Completion
-/// handlers bridge to tokio via oneshot channels.
+/// Owns the `VZVirtualMachine` instance, its dedicated dispatch queue, and
+/// the delegate. VM operations call the framework API directly — the
+/// framework dispatches to the VM's queue internally. Completions are
+/// bridged back via `std::sync::mpsc` channels.
 pub struct VmHandle {
     vm: SendVm,
+    _queue: DispatchRetained<DispatchQueue>,
     _delegate: Retained<VmDelegate>,
     state_rx: watch::Receiver<VmState>,
 }
 
-// SAFETY: VmHandle is Send because:
-// - SendVm wraps the VM with the guarantee that all access is serialized
-// - The delegate is a Retained objc object only accessed from the queue
-// - watch::Receiver is Send
+// SAFETY: VmHandle is Send because the framework serializes all VM access
+// through its internal dispatch queue.
 unsafe impl Send for VmHandle {}
 
 impl VmHandle {
     /// Create a new VM from configuration.
     ///
     /// Validates the config, builds the `VZVirtualMachineConfiguration`,
-    /// creates the VM on the main dispatch queue, and sets up the delegate.
+    /// creates the VM bound to a dedicated serial dispatch queue, and
+    /// sets up the delegate for state change notifications.
     pub fn create(vm_config: VmConfig) -> Result<Self, KasouError> {
         vm_config.validate()?;
 
@@ -95,10 +97,18 @@ impl VmHandle {
         let state_tx = Arc::new(state_tx);
         let delegate = VmDelegate::new(Arc::clone(&state_tx));
 
-        // SAFETY: initWithConfiguration creates a VM using the main queue.
-        // All subsequent operations must happen on the main queue.
+        // Create a dedicated serial dispatch queue for this VM.
+        // The framework dispatches all VM operations and delegate callbacks here.
+        let queue = DispatchQueue::new("io.pleme.kasou.vm", None);
+
+        // SAFETY: initWithConfiguration_queue creates a VM bound to our serial queue.
+        // The configuration has been validated via validateWithError in build_vz_config.
         let vm = unsafe {
-            VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &vz_config)
+            VZVirtualMachine::initWithConfiguration_queue(
+                VZVirtualMachine::alloc(),
+                &vz_config,
+                &queue,
+            )
         };
 
         // SAFETY: setDelegate assigns the delegate for state change callbacks.
@@ -108,6 +118,7 @@ impl VmHandle {
 
         Ok(Self {
             vm: SendVm(vm),
+            _queue: queue,
             _delegate: delegate,
             state_rx,
         })
@@ -115,26 +126,16 @@ impl VmHandle {
 
     /// Start the virtual machine.
     ///
-    /// The VM must be in Stopped or Error state.
-    /// The completion handler signals success/failure via a oneshot channel.
-    pub async fn start(&self) -> Result<(), KasouError> {
-        let can_start = unsafe { self.vm.0.canStart() };
-        if !can_start {
-            let state = unsafe { self.vm.0.state() };
-            return Err(KasouError::InvalidState {
-                current: VmState::from_vz(state).to_string(),
-                expected: "stopped or error".into(),
-            });
-        }
+    /// Calls `startWithCompletionHandler:` — the framework dispatches to the
+    /// VM's queue internally. Blocks the calling thread until completion.
+    pub fn start(&self) -> Result<(), KasouError> {
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = std::sync::Mutex::new(Some(tx));
-
         let block = RcBlock::new(move |error: *mut NSError| {
             let result = if error.is_null() {
                 Ok(())
             } else {
-                // SAFETY: error is a valid NSError pointer when non-null.
                 let desc = unsafe { (*error).localizedDescription() }.to_string();
                 Err(KasouError::OperationFailed(format!("start failed: {desc}")))
             };
@@ -143,29 +144,22 @@ impl VmHandle {
             }
         });
 
-        // SAFETY: startWithCompletionHandler begins VM execution.
+        // SAFETY: startWithCompletionHandler dispatches start to the VM's queue.
+        // The completion handler fires on that queue when done.
         unsafe { self.vm.0.startWithCompletionHandler(&block) };
 
-        rx.await.map_err(|_| KasouError::QueueCancelled)?
+        // Block until the completion handler fires
+        rx.recv().map_err(|_| KasouError::QueueCancelled)?
     }
 
     /// Stop the virtual machine (hard stop).
     ///
     /// Destructive — the guest does not get a chance to shut down cleanly.
     /// Use `request_stop()` for graceful shutdown.
-    pub async fn stop(&self) -> Result<(), KasouError> {
-        let can_stop = unsafe { self.vm.0.canStop() };
-        if !can_stop {
-            let state = unsafe { self.vm.0.state() };
-            return Err(KasouError::InvalidState {
-                current: VmState::from_vz(state).to_string(),
-                expected: "running or paused".into(),
-            });
-        }
+    pub fn stop(&self) -> Result<(), KasouError> {
+        let (tx, rx) = std::sync::mpsc::channel();
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let tx = std::sync::Mutex::new(Some(tx));
-
         let block = RcBlock::new(move |error: *mut NSError| {
             let result = if error.is_null() {
                 Ok(())
@@ -178,10 +172,10 @@ impl VmHandle {
             }
         });
 
-        // SAFETY: stopWithCompletionHandler terminates the VM.
+        // SAFETY: stopWithCompletionHandler dispatches stop to the VM's queue.
         unsafe { self.vm.0.stopWithCompletionHandler(&block) };
 
-        rx.await.map_err(|_| KasouError::QueueCancelled)?
+        rx.recv().map_err(|_| KasouError::QueueCancelled)?
     }
 
     /// Request the guest to stop (graceful shutdown via ACPI power button).
@@ -191,70 +185,6 @@ impl VmHandle {
             let desc = e.localizedDescription().to_string();
             KasouError::OperationFailed(format!("request stop failed: {desc}"))
         })
-    }
-
-    /// Pause the virtual machine.
-    pub async fn pause(&self) -> Result<(), KasouError> {
-        let can_pause = unsafe { self.vm.0.canPause() };
-        if !can_pause {
-            let state = unsafe { self.vm.0.state() };
-            return Err(KasouError::InvalidState {
-                current: VmState::from_vz(state).to_string(),
-                expected: "running".into(),
-            });
-        }
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = std::sync::Mutex::new(Some(tx));
-
-        let block = RcBlock::new(move |error: *mut NSError| {
-            let result = if error.is_null() {
-                Ok(())
-            } else {
-                let desc = unsafe { (*error).localizedDescription() }.to_string();
-                Err(KasouError::OperationFailed(format!("pause failed: {desc}")))
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-        });
-
-        // SAFETY: pauseWithCompletionHandler suspends the VM.
-        unsafe { self.vm.0.pauseWithCompletionHandler(&block) };
-
-        rx.await.map_err(|_| KasouError::QueueCancelled)?
-    }
-
-    /// Resume a paused virtual machine.
-    pub async fn resume(&self) -> Result<(), KasouError> {
-        let can_resume = unsafe { self.vm.0.canResume() };
-        if !can_resume {
-            let state = unsafe { self.vm.0.state() };
-            return Err(KasouError::InvalidState {
-                current: VmState::from_vz(state).to_string(),
-                expected: "paused".into(),
-            });
-        }
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let tx = std::sync::Mutex::new(Some(tx));
-
-        let block = RcBlock::new(move |error: *mut NSError| {
-            let result = if error.is_null() {
-                Ok(())
-            } else {
-                let desc = unsafe { (*error).localizedDescription() }.to_string();
-                Err(KasouError::OperationFailed(format!("resume failed: {desc}")))
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
-        });
-
-        // SAFETY: resumeWithCompletionHandler resumes the VM from paused state.
-        unsafe { self.vm.0.resumeWithCompletionHandler(&block) };
-
-        rx.await.map_err(|_| KasouError::QueueCancelled)?
     }
 
     /// Get the current VM state.
