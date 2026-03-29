@@ -1,0 +1,66 @@
+[package]
+name = "kasou"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89.0"
+description = "Kasou (仮想) — safe Apple Virtualization.framework bindings for macOS VM management"
+homepage = "https://github.com/pleme-io/kasou"
+repository = "https://github.com/pleme-io/kasou"
+license = "MIT"
+categories = ["os::macos-apis"]
+keywords = ["macos", "virtualization", "vm", "apple", "hypervisor"]
+
+[lints.clippy]
+pedantic = "warn"
+
+[dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSError",
+    "NSString",
+    "NSURL",
+] }
+objc2-virtualization = { version = "0.3", features = [
+    "block2",
+    "dispatch2",
+    "VZBootLoader",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZFileSerialPortAttachment",
+    "VZLinuxBootLoader",
+    "VZMACAddress",
+    "VZNATNetworkDeviceAttachment",
+    "VZNetworkDeviceConfiguration",
+    "VZSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZSharedDirectory",
+    "VZSingleDirectoryShare",
+    "VZStorageDeviceAttachment",
+    "VZStorageDeviceConfiguration",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioFileSystemDeviceConfiguration",
+    "VZVirtioNetworkDeviceConfiguration",
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZVirtualMachineDelegate",
+    "VZDirectoryShare",
+    "VZDirectorySharingDeviceConfiguration",
+    "VZGenericPlatformConfiguration",
+    "VZPlatformConfiguration",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZEntropyDeviceConfiguration",
+] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true
