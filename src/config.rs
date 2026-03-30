@@ -143,6 +143,8 @@ pub(crate) fn build_vz_config(
     // SAFETY: setEntropyDevices is valid.
     unsafe { vz_config.setEntropyDevices(&entropy_array) };
 
+    tracing::debug!("validating VZ configuration...");
+
     // Validate the complete configuration
     // SAFETY: validateWithError checks all VZ constraints and returns an error if invalid.
     unsafe { vz_config.validateWithError() }.map_err(|e| {
@@ -150,6 +152,7 @@ pub(crate) fn build_vz_config(
         KasouError::Framework(format!("VM configuration validation failed: {desc}"))
     })?;
 
+    tracing::debug!("VZ configuration validated successfully");
     Ok(vz_config)
 }
 

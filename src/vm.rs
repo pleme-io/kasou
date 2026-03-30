@@ -65,6 +65,13 @@ impl std::fmt::Display for VmState {
 struct SendVm(Retained<VZVirtualMachine>);
 unsafe impl Send for SendVm {}
 
+/// Send-safe raw pointer to VZVirtualMachine for dispatch queue closures.
+///
+/// SAFETY: The pointer is valid for the lifetime of the owning VmHandle.
+/// All access happens on the VM's serial dispatch queue.
+struct SendVmPtr(*const VZVirtualMachine);
+unsafe impl Send for SendVmPtr {}
+
 /// Handle to a virtual machine.
 ///
 /// Owns the `VZVirtualMachine` instance, its dedicated dispatch queue, and
@@ -91,7 +98,9 @@ impl VmHandle {
     pub fn create(vm_config: VmConfig) -> Result<Self, KasouError> {
         vm_config.validate()?;
 
+        tracing::info!("building VZ configuration");
         let vz_config = config::build_vz_config(&vm_config)?;
+        tracing::info!("VZ configuration built successfully");
 
         let (state_tx, state_rx) = watch::channel(VmState::Stopped);
         let state_tx = Arc::new(state_tx);
@@ -101,6 +110,7 @@ impl VmHandle {
         // The framework dispatches all VM operations and delegate callbacks here.
         let queue = DispatchQueue::new("io.pleme.kasou.vm", None);
 
+        tracing::info!("creating VZVirtualMachine with dedicated dispatch queue");
         // SAFETY: initWithConfiguration_queue creates a VM bound to our serial queue.
         // The configuration has been validated via validateWithError in build_vz_config.
         let vm = unsafe {
@@ -111,6 +121,7 @@ impl VmHandle {
             )
         };
 
+        tracing::info!("VZVirtualMachine created, setting delegate");
         // SAFETY: setDelegate assigns the delegate for state change callbacks.
         unsafe {
             vm.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -130,25 +141,29 @@ impl VmHandle {
     /// VM's queue internally. Blocks the calling thread until completion.
     pub fn start(&self) -> Result<(), KasouError> {
         let (tx, rx) = std::sync::mpsc::channel();
+        // Cast pointer to usize (which is Send) to move into the closure.
+        // SAFETY: the pointer is valid for the lifetime of VmHandle, and
+        // we block on rx.recv() below, so VmHandle cannot be dropped.
+        let vm_addr = &*self.vm.0 as *const VZVirtualMachine as usize;
 
-        let tx = std::sync::Mutex::new(Some(tx));
-        let block = RcBlock::new(move |error: *mut NSError| {
-            let result = if error.is_null() {
-                Ok(())
-            } else {
-                let desc = unsafe { (*error).localizedDescription() }.to_string();
-                Err(KasouError::OperationFailed(format!("start failed: {desc}")))
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
+        self._queue.exec_async(move || {
+            let tx = std::sync::Mutex::new(Some(tx));
+            let block = RcBlock::new(move |error: *mut NSError| {
+                let result = if error.is_null() {
+                    Ok(())
+                } else {
+                    let desc = unsafe { (*error).localizedDescription() }.to_string();
+                    Err(KasouError::OperationFailed(format!("start failed: {desc}")))
+                };
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            });
+
+            let vm_ptr = vm_addr as *const VZVirtualMachine;
+            unsafe { (*vm_ptr).startWithCompletionHandler(&block) };
         });
 
-        // SAFETY: startWithCompletionHandler dispatches start to the VM's queue.
-        // The completion handler fires on that queue when done.
-        unsafe { self.vm.0.startWithCompletionHandler(&block) };
-
-        // Block until the completion handler fires
         rx.recv().map_err(|_| KasouError::QueueCancelled)?
     }
 
@@ -158,22 +173,25 @@ impl VmHandle {
     /// Use `request_stop()` for graceful shutdown.
     pub fn stop(&self) -> Result<(), KasouError> {
         let (tx, rx) = std::sync::mpsc::channel();
+        let vm_addr = &*self.vm.0 as *const VZVirtualMachine as usize;
 
-        let tx = std::sync::Mutex::new(Some(tx));
-        let block = RcBlock::new(move |error: *mut NSError| {
-            let result = if error.is_null() {
-                Ok(())
-            } else {
-                let desc = unsafe { (*error).localizedDescription() }.to_string();
-                Err(KasouError::OperationFailed(format!("stop failed: {desc}")))
-            };
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(result);
-            }
+        self._queue.exec_async(move || {
+            let tx = std::sync::Mutex::new(Some(tx));
+            let block = RcBlock::new(move |error: *mut NSError| {
+                let result = if error.is_null() {
+                    Ok(())
+                } else {
+                    let desc = unsafe { (*error).localizedDescription() }.to_string();
+                    Err(KasouError::OperationFailed(format!("stop failed: {desc}")))
+                };
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            });
+
+            let vm_ptr = vm_addr as *const VZVirtualMachine;
+            unsafe { (*vm_ptr).stopWithCompletionHandler(&block) };
         });
-
-        // SAFETY: stopWithCompletionHandler dispatches stop to the VM's queue.
-        unsafe { self.vm.0.stopWithCompletionHandler(&block) };
 
         rx.recv().map_err(|_| KasouError::QueueCancelled)?
     }
