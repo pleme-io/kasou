@@ -16,7 +16,7 @@ pedantic = "warn"
 [dependencies]
 block2 = "0.6"
 dispatch2 = "0.3"
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = { version = "0.3", features = [
     "NSError",
     "NSString",

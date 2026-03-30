@@ -70,10 +70,31 @@ impl VmConfig {
 }
 
 /// Build a `VZVirtualMachineConfiguration` from our `VmConfig`.
+///
+/// Wrapped in `objc2::exception::catch` to handle NSExceptions from the
+/// framework (e.g., invalid parameters that throw rather than return NSError).
 pub(crate) fn build_vz_config(
     config: &VmConfig,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, KasouError> {
-    // SAFETY: VZVirtualMachineConfiguration::new() creates a default configuration.
+    // Catch ObjC exceptions that VZ may throw for deeply invalid configs.
+    // These would otherwise SIGTRAP the process.
+    let result = unsafe {
+        objc2::exception::catch(|| build_vz_config_inner(config))
+    };
+    match result {
+        Ok(inner) => inner,
+        Err(exception) => {
+            let desc = format!("{exception:?}");
+            Err(KasouError::Framework(format!(
+                "Objective-C exception during VZ configuration: {desc}"
+            )))
+        }
+    }
+}
+
+fn build_vz_config_inner(
+    config: &VmConfig,
+) -> Result<Retained<VZVirtualMachineConfiguration>, KasouError> {
     let vz_config = unsafe { VZVirtualMachineConfiguration::new() };
 
     // CPU and memory
