@@ -55,17 +55,17 @@ fn parse_mac_address(mac: &str) -> Result<Retained<VZMACAddress>, KasouError> {
     vz_mac.ok_or_else(|| KasouError::InvalidMac(mac.to_string()))
 }
 
-/// Generate a deterministic locally-administered MAC address from a unique ID.
+/// Generate a deterministic locally-administered MAC address.
 ///
 /// Delegates to [`MacAddress::deterministic`] and returns the string form.
 ///
 /// # Example
 /// ```
-/// let mac = kasou::deterministic_mac("cid-k3s");
+/// let mac = kasou::deterministic_mac("my-host", "cid-k3s");
 /// assert!(mac.starts_with("52:55:55:"));
 /// ```
-pub fn deterministic_mac(unique_id: &str) -> String {
-    crate::types::MacAddress::deterministic(unique_id).to_string()
+pub fn deterministic_mac(seed: &str, unique_id: &str) -> String {
+    crate::types::MacAddress::deterministic(seed, unique_id).to_string()
 }
 
 #[cfg(test)]
@@ -91,16 +91,16 @@ mod tests {
 
     #[test]
     fn deterministic_mac_is_stable() {
-        let mac1 = deterministic_mac("cid-k3s");
-        let mac2 = deterministic_mac("cid-k3s");
+        let mac1 = deterministic_mac("host", "cid-k3s");
+        let mac2 = deterministic_mac("host", "cid-k3s");
         assert_eq!(mac1, mac2, "same input should produce same MAC");
         assert!(mac1.starts_with("52:55:55:"), "should use locally-administered prefix");
     }
 
     #[test]
     fn deterministic_mac_differs_per_cluster() {
-        let mac1 = deterministic_mac("cid-k3s");
-        let mac2 = deterministic_mac("ryn-k3s");
+        let mac1 = deterministic_mac("host", "cid-k3s");
+        let mac2 = deterministic_mac("host", "ryn-k3s");
         assert_ne!(mac1, mac2, "different clusters should get different MACs");
     }
 

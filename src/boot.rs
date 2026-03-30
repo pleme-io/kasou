@@ -2,9 +2,10 @@ use std::path::Path;
 
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_foundation::{NSString, NSURL};
+use objc2_foundation::NSString;
 use objc2_virtualization::VZLinuxBootLoader;
 
+use crate::util::path_to_nsurl;
 use crate::KasouError;
 
 /// Configuration for direct Linux kernel boot.
@@ -36,28 +37,12 @@ pub(crate) fn create_boot_loader(config: &BootConfig) -> Result<Retained<VZLinux
     let initrd_url = path_to_nsurl(&config.initrd)?;
     let cmdline = NSString::from_str(&config.cmdline);
 
-    // SAFETY: initWithKernelURL takes a valid file URL for the kernel image.
-    // We verified the file exists above.
     let loader = unsafe {
         VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url)
     };
 
-    // SAFETY: setInitialRamdiskURL is valid on any VZLinuxBootLoader instance.
     unsafe { loader.setInitialRamdiskURL(Some(&initrd_url)) };
-
-    // SAFETY: setCommandLine is valid on any VZLinuxBootLoader instance.
     unsafe { loader.setCommandLine(&cmdline) };
 
     Ok(loader)
-}
-
-fn path_to_nsurl(path: &Path) -> Result<Retained<NSURL>, KasouError> {
-    let path_str = path.to_str().ok_or_else(|| {
-        KasouError::InvalidConfig(format!("path is not valid UTF-8: {}", path.display()))
-    })?;
-    let ns_path = NSString::from_str(path_str);
-
-    // SAFETY: initFileURLWithPath creates a file URL from a filesystem path string.
-    let url = NSURL::initFileURLWithPath(NSURL::alloc(), &ns_path);
-    Ok(url)
 }

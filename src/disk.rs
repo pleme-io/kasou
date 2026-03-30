@@ -1,13 +1,11 @@
-use std::path::Path;
-
 use objc2::AnyThread;
 use objc2::rc::Retained;
-use objc2_foundation::{NSString, NSURL};
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment,
     VZDiskImageSynchronizationMode, VZVirtioBlockDeviceConfiguration,
 };
 
+use crate::util::{ns_error_description, path_to_nsurl};
 use crate::KasouError;
 
 /// Configuration for a virtio block device backed by a disk image.
@@ -56,17 +54,4 @@ pub(crate) fn create_storage_device(
     };
 
     Ok(device)
-}
-
-fn path_to_nsurl(path: &Path) -> Result<Retained<NSURL>, KasouError> {
-    let path_str = path.to_str().ok_or_else(|| {
-        KasouError::InvalidConfig(format!("path is not valid UTF-8: {}", path.display()))
-    })?;
-    let ns_path = NSString::from_str(path_str);
-    let url = NSURL::initFileURLWithPath(NSURL::alloc(), &ns_path);
-    Ok(url)
-}
-
-fn ns_error_description(error: &objc2_foundation::NSError) -> String {
-    error.localizedDescription().to_string()
 }

@@ -52,7 +52,6 @@ objc2-virtualization = { version = "0.3", features = [
     "VZVirtioEntropyDeviceConfiguration",
     "VZEntropyDeviceConfiguration",
 ] }
-hostname = "0.4"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }

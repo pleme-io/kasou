@@ -37,7 +37,9 @@ pub struct VmConfigBuilder {
     id: VmId,
     cpus: u32,
     memory_mib: u64,
-    boot: Option<BootConfig>,
+    kernel: Option<PathBuf>,
+    initrd: Option<PathBuf>,
+    cmdline: Option<String>,
     disks: Vec<DiskConfig>,
     mac: Option<String>,
     serial: Option<SerialConfig>,
@@ -51,7 +53,9 @@ impl VmConfigBuilder {
             id: id.into(),
             cpus: 2,
             memory_mib: 2048,
-            boot: None,
+            kernel: None,
+            initrd: None,
+            cmdline: None,
             disks: Vec::new(),
             mac: None,
             serial: None,
@@ -73,27 +77,19 @@ impl VmConfigBuilder {
 
     /// Set the kernel path for direct Linux boot.
     pub fn boot(mut self, kernel: PathBuf) -> Self {
-        self.boot = Some(BootConfig {
-            kernel,
-            initrd: PathBuf::new(),
-            cmdline: String::new(),
-        });
+        self.kernel = Some(kernel);
         self
     }
 
-    /// Set the initrd path (must call `boot()` first).
+    /// Set the initrd path (order-independent — can be called before or after `boot()`).
     pub fn initrd(mut self, initrd: PathBuf) -> Self {
-        if let Some(ref mut boot) = self.boot {
-            boot.initrd = initrd;
-        }
+        self.initrd = Some(initrd);
         self
     }
 
-    /// Set the kernel command line (must call `boot()` first).
+    /// Set the kernel command line (order-independent).
     pub fn cmdline(mut self, cmdline: impl Into<String>) -> Self {
-        if let Some(ref mut boot) = self.boot {
-            boot.cmdline = cmdline.into();
-        }
+        self.cmdline = Some(cmdline.into());
         self
     }
 
@@ -127,9 +123,9 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Generate a deterministic MAC from the VM's ID.
-    pub fn deterministic_mac(mut self) -> Self {
-        self.mac = Some(MacAddress::deterministic(&self.id.0).to_string());
+    /// Generate a deterministic MAC from a seed (e.g., hostname) and the VM's ID.
+    pub fn deterministic_mac(mut self, seed: &str) -> Self {
+        self.mac = Some(MacAddress::deterministic(seed, &self.id.0).to_string());
         self
     }
 
@@ -156,9 +152,17 @@ impl VmConfigBuilder {
 
     /// Build the `VmConfig`, validating all required fields.
     pub fn build(self) -> Result<VmConfig, KasouError> {
-        let boot = self.boot.ok_or_else(|| {
-            KasouError::Validation("boot configuration is required (call .boot())".into())
+        let kernel = self.kernel.ok_or_else(|| {
+            KasouError::Validation("kernel path is required (call .boot())".into())
         })?;
+        let initrd = self.initrd.ok_or_else(|| {
+            KasouError::Validation("initrd path is required (call .initrd())".into())
+        })?;
+        let boot = BootConfig {
+            kernel,
+            initrd,
+            cmdline: self.cmdline.unwrap_or_default(),
+        };
 
         let config = VmConfig {
             cpus: self.cpus,
@@ -183,20 +187,42 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn builder_validates_missing_boot() {
+    fn builder_validates_missing_kernel() {
         let result = VmConfigBuilder::new("test")
-            .cpus(2)
-            .memory_mib(1024)
+            .initrd(PathBuf::from("/initrd"))
             .disk(PathBuf::from("/tmp/disk.img"))
             .build();
-
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("boot"));
+        assert!(result.unwrap_err().to_string().contains("kernel"));
+    }
+
+    #[test]
+    fn builder_validates_missing_initrd() {
+        let result = VmConfigBuilder::new("test")
+            .boot(PathBuf::from("/kernel"))
+            .disk(PathBuf::from("/tmp/disk.img"))
+            .build();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("initrd"));
+    }
+
+    #[test]
+    fn builder_order_independent() {
+        // initrd and cmdline can be set before boot — no silent failure
+        let builder = VmConfigBuilder::new("test")
+            .cmdline("console=hvc0")
+            .initrd(PathBuf::from("/initrd"))
+            .boot(PathBuf::from("/kernel"))
+            .disk(PathBuf::from("/disk.img"));
+
+        assert!(builder.kernel.is_some());
+        assert!(builder.initrd.is_some());
+        assert!(builder.cmdline.is_some());
     }
 
     #[test]
     fn builder_sets_deterministic_mac() {
-        let builder = VmConfigBuilder::new("cid-k3s").deterministic_mac();
+        let builder = VmConfigBuilder::new("cid-k3s").deterministic_mac("my-host");
         assert!(builder.mac.is_some());
         assert!(builder.mac.unwrap().starts_with("52:55:55:"));
     }
@@ -219,7 +245,7 @@ mod tests {
         assert_eq!(builder.cpus, 4);
         assert_eq!(builder.memory_mib, 8192);
         assert_eq!(builder.disks.len(), 2);
-        assert!(builder.boot.is_some());
+        assert!(builder.kernel.is_some());
         assert!(builder.serial.is_some());
         assert_eq!(builder.shared_dirs.len(), 1);
     }

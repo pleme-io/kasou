@@ -26,7 +26,7 @@
 //!     .initrd(PathBuf::from("/path/to/initrd"))
 //!     .cmdline("console=hvc0 root=/dev/vda")
 //!     .disk(PathBuf::from("/path/to/root.img"))
-//!     .deterministic_mac()
+//!     .deterministic_mac("my-host")
 //!     .build()
 //!     .unwrap();
 //!
@@ -44,6 +44,7 @@ pub mod event;
 mod network;
 mod serial;
 mod shared_dir;
+mod util;
 pub mod types;
 pub mod vm;
 
@@ -58,7 +59,7 @@ pub use shared_dir::SharedDirConfig;
 
 // Platform types
 pub use types::{
-    BalloonConfig, DiskMetrics, MacAddress, MacParseError, NetworkAttachment,
+    BalloonConfig, DiskMetrics, MacAddress, NetworkAttachment,
     NetworkMetrics, VmId, VmInfo, VmMetrics, VsockConfig,
 };
 

@@ -24,10 +24,10 @@ pub enum KasouError {
     #[error("configuration validation failed: {0}")]
     Validation(String),
 
-    #[error("VM is not in a valid state for this operation: current={current}, expected={expected}")]
+    #[error("VM is in state {current}, expected {expected}")]
     InvalidState {
-        current: String,
-        expected: String,
+        current: crate::vm::VmState,
+        expected: &'static str,
     },
 
     #[error("dispatch queue operation cancelled")]

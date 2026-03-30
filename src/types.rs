@@ -35,18 +35,22 @@ impl From<String> for VmId {
 pub struct MacAddress(pub [u8; 6]);
 
 impl MacAddress {
-    /// Generate a deterministic locally-administered MAC from a unique ID.
+    /// Generate a deterministic locally-administered MAC from a seed and unique ID.
     ///
-    /// Uses hostname + unique_id hash for stability across reboots.
+    /// The seed should be stable across reboots (e.g., hostname, machine-id).
     /// Follows Lima convention: `52:55:55:xx:xx:xx` prefix.
-    pub fn deterministic(unique_id: &str) -> Self {
+    ///
+    /// ```
+    /// use kasou::MacAddress;
+    /// let mac = MacAddress::deterministic("my-host", "my-vm");
+    /// assert!(mac.to_string().starts_with("52:55:55:"));
+    /// ```
+    pub fn deterministic(seed: &str, unique_id: &str) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        if let Ok(hostname) = hostname::get() {
-            hostname.to_string_lossy().hash(&mut hasher);
-        }
+        seed.hash(&mut hasher);
         unique_id.hash(&mut hasher);
         let hash = hasher.finish().to_le_bytes();
 
@@ -54,15 +58,15 @@ impl MacAddress {
     }
 
     /// Parse a MAC address from colon-separated string (e.g., "5a:94:ef:ab:cd:12").
-    pub fn parse(s: &str) -> Result<Self, MacParseError> {
+    pub fn parse(s: &str) -> Result<Self, crate::KasouError> {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() != 6 {
-            return Err(MacParseError(s.to_string()));
+            return Err(crate::KasouError::InvalidMac(s.to_string()));
         }
         let mut bytes = [0u8; 6];
         for (i, part) in parts.iter().enumerate() {
             bytes[i] = u8::from_str_radix(part, 16)
-                .map_err(|_| MacParseError(s.to_string()))?;
+                .map_err(|_| crate::KasouError::InvalidMac(s.to_string()))?;
         }
         Ok(Self(bytes))
     }
@@ -77,11 +81,6 @@ impl fmt::Display for MacAddress {
         )
     }
 }
-
-/// Error when parsing a MAC address string.
-#[derive(Debug, thiserror::Error)]
-#[error("invalid MAC address: {0}")]
-pub struct MacParseError(pub String);
 
 /// Network attachment strategy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,15 +165,20 @@ mod tests {
     #[test]
     fn mac_address_parse_invalid() {
         assert!(MacAddress::parse("not-a-mac").is_err());
-        assert!(MacAddress::parse("5a:94:ef:ab:cd").is_err()); // too short
-        assert!(MacAddress::parse("5a:94:ef:ab:cd:12:ff").is_err()); // too long
-        assert!(MacAddress::parse("gg:94:ef:ab:cd:12").is_err()); // invalid hex
+        assert!(MacAddress::parse("5a:94:ef:ab:cd").is_err());
+        assert!(MacAddress::parse("5a:94:ef:ab:cd:12:ff").is_err());
+        assert!(MacAddress::parse("gg:94:ef:ab:cd:12").is_err());
+        // Verify it returns KasouError::InvalidMac
+        match MacAddress::parse("bad") {
+            Err(crate::KasouError::InvalidMac(s)) => assert_eq!(s, "bad"),
+            other => panic!("expected InvalidMac, got {other:?}"),
+        }
     }
 
     #[test]
     fn mac_address_deterministic_stable() {
-        let a = MacAddress::deterministic("cid-k3s");
-        let b = MacAddress::deterministic("cid-k3s");
+        let a = MacAddress::deterministic("host", "cid-k3s");
+        let b = MacAddress::deterministic("host", "cid-k3s");
         assert_eq!(a, b);
         assert_eq!(a.0[0], 0x52); // locally-administered prefix
         assert_eq!(a.0[1], 0x55);
@@ -183,8 +187,8 @@ mod tests {
 
     #[test]
     fn mac_address_deterministic_differs() {
-        let a = MacAddress::deterministic("cid-k3s");
-        let b = MacAddress::deterministic("ryn-k3s");
+        let a = MacAddress::deterministic("host", "cid-k3s");
+        let b = MacAddress::deterministic("host", "ryn-k3s");
         assert_ne!(a, b);
     }
 
