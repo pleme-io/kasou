@@ -22,6 +22,7 @@ fn main() {
     eprintln!("disk:   {}", disk.display());
 
     let config = kasou::VmConfig {
+        id: kasou::VmId::from("smoke-test"),
         cpus: 2,
         memory_mib: 2048,
         boot: kasou::BootConfig {

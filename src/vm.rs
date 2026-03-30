@@ -13,6 +13,8 @@ use tokio::sync::watch;
 
 use crate::config::{self, VmConfig};
 use crate::delegate::VmDelegate;
+use crate::event::{VmEvent, VmEventBus, VmEventKind};
+use crate::types::{VmId, VmInfo};
 use crate::KasouError;
 
 /// VM lifecycle state as observed from Rust.
@@ -136,6 +138,9 @@ pub struct VmHandle {
     queue: DispatchRetained<DispatchQueue>,
     _delegate: Retained<VmDelegate>,
     state_rx: watch::Receiver<VmState>,
+    config: VmConfig,
+    event_bus: Arc<VmEventBus>,
+    created_at: std::time::Instant,
 }
 
 unsafe impl Send for VmHandle {}
@@ -238,17 +243,17 @@ impl VmHandle {
     pub fn create(vm_config: VmConfig) -> Result<Self, KasouError> {
         vm_config.validate()?;
 
-        tracing::info!("building VZ configuration");
+        tracing::info!(id = %vm_config.id, "building VZ configuration");
         let vz_config = config::build_vz_config(&vm_config)?;
-        tracing::info!("VZ configuration built successfully");
 
         let (state_tx, state_rx) = watch::channel(VmState::Stopped);
         let state_tx = Arc::new(state_tx);
         let delegate = VmDelegate::new(Arc::clone(&state_tx));
+        let event_bus = Arc::new(VmEventBus::default());
 
         let queue = DispatchQueue::new("io.pleme.kasou.vm", None);
 
-        tracing::info!("creating VZVirtualMachine with dedicated dispatch queue");
+        tracing::info!(id = %vm_config.id, "creating VZVirtualMachine");
         let vm = unsafe {
             VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
@@ -257,7 +262,6 @@ impl VmHandle {
             )
         };
 
-        tracing::info!("VZVirtualMachine created, setting delegate");
         unsafe {
             vm.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         };
@@ -267,6 +271,9 @@ impl VmHandle {
             queue,
             _delegate: delegate,
             state_rx,
+            config: vm_config,
+            event_bus,
+            created_at: std::time::Instant::now(),
         })
     }
 
@@ -353,5 +360,43 @@ impl VmHandle {
     /// Get a watch receiver for observing state changes.
     pub fn state_watch(&self) -> watch::Receiver<VmState> {
         self.state_rx.clone()
+    }
+
+    /// Get the VM's configuration.
+    pub fn config(&self) -> &VmConfig {
+        &self.config
+    }
+
+    /// Get the VM's identifier.
+    pub fn id(&self) -> &VmId {
+        &self.config.id
+    }
+
+    /// Subscribe to VM lifecycle events.
+    pub fn events(&self) -> tokio::sync::broadcast::Receiver<VmEvent> {
+        self.event_bus.subscribe()
+    }
+
+    /// Get runtime information about this VM.
+    pub fn info(&self) -> VmInfo {
+        let uptime = self.created_at.elapsed().as_secs();
+        VmInfo {
+            id: self.config.id.clone(),
+            state: self.state(),
+            pid: Some(std::process::id()),
+            uptime_secs: Some(uptime),
+            mac_address: self.config.network.mac_address.as_ref()
+                .and_then(|m| crate::types::MacAddress::parse(m).ok()),
+            ip_address: None, // would need DHCP lease lookup
+        }
+    }
+
+    /// Emit a lifecycle event.
+    fn emit(&self, kind: VmEventKind) {
+        self.event_bus.emit(VmEvent {
+            timestamp: std::time::Instant::now(),
+            vm_id: self.config.id.clone(),
+            kind,
+        });
     }
 }

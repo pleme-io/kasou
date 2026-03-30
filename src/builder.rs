@@ -165,6 +165,7 @@ impl VmConfigBuilder {
         };
 
         let config = VmConfig {
+            id: self.id,
             cpus: self.cpus,
             memory_mib: self.memory_mib,
             boot,

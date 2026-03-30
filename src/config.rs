@@ -16,10 +16,13 @@ use crate::KasouError;
 
 /// Complete VM configuration.
 ///
-/// Mirrors the parameters that vfkit accepts on its command line,
-/// but with full MAC address control at the hypervisor level.
+/// Defines everything needed to create and boot a virtual machine:
+/// CPU, memory, boot source, storage, networking, and peripherals.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VmConfig {
+    /// Unique identifier for this VM.
+    #[serde(default)]
+    pub id: crate::types::VmId,
     /// Number of virtual CPUs.
     pub cpus: u32,
     /// Memory size in MiB.
@@ -78,9 +81,7 @@ pub(crate) fn build_vz_config(
 ) -> Result<Retained<VZVirtualMachineConfiguration>, KasouError> {
     // Catch ObjC exceptions that VZ may throw for deeply invalid configs.
     // These would otherwise SIGTRAP the process.
-    let result = unsafe {
-        objc2::exception::catch(|| build_vz_config_inner(config))
-    };
+    let result = objc2::exception::catch(|| build_vz_config_inner(config));
     match result {
         Ok(inner) => inner,
         Err(exception) => {
@@ -185,6 +186,7 @@ mod tests {
     #[test]
     fn validate_rejects_zero_cpus() {
         let config = VmConfig {
+            id: crate::types::VmId::default(),
             cpus: 0,
             memory_mib: 1024,
             boot: BootConfig {
@@ -207,6 +209,7 @@ mod tests {
     #[test]
     fn validate_rejects_zero_memory() {
         let config = VmConfig {
+            id: crate::types::VmId::default(),
             cpus: 1,
             memory_mib: 0,
             boot: BootConfig {
@@ -229,6 +232,7 @@ mod tests {
     #[test]
     fn validate_rejects_no_disks() {
         let config = VmConfig {
+            id: crate::types::VmId::default(),
             cpus: 1,
             memory_mib: 1024,
             boot: BootConfig {

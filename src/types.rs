@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VmId(pub String);
 
+impl Default for VmId {
+    fn default() -> Self {
+        Self(String::new())
+    }
+}
+
 impl fmt::Display for VmId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
