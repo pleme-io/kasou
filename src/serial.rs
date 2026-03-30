@@ -8,7 +8,7 @@ use objc2_virtualization::{VZFileSerialPortAttachment, VZVirtioConsoleDeviceSeri
 use crate::KasouError;
 
 /// Configuration for a serial console that logs to a file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SerialConfig {
     /// Path to the file where console output will be written.
     pub log_path: std::path::PathBuf,

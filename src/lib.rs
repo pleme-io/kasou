@@ -42,7 +42,6 @@ mod disk;
 mod error;
 pub mod event;
 mod network;
-mod queue;
 mod serial;
 mod shared_dir;
 pub mod types;

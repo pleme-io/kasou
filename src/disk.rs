@@ -11,7 +11,7 @@ use objc2_virtualization::{
 use crate::KasouError;
 
 /// Configuration for a virtio block device backed by a disk image.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiskConfig {
     /// Path to the raw disk image file.
     pub path: std::path::PathBuf,

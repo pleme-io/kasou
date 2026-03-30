@@ -6,7 +6,7 @@ use objc2_virtualization::{VZMACAddress, VZNATNetworkDeviceAttachment, VZVirtioN
 use crate::KasouError;
 
 /// Network configuration for a VM.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NetworkConfig {
     /// Optional MAC address (e.g. "5a:94:ef:ab:cd:12").
     ///
@@ -57,9 +57,7 @@ fn parse_mac_address(mac: &str) -> Result<Retained<VZMACAddress>, KasouError> {
 
 /// Generate a deterministic locally-administered MAC address from a unique ID.
 ///
-/// Uses SHA-256 of the macOS hardware UUID + unique_id to produce a stable
-/// MAC that is consistent across reboots for the same VM on the same host.
-/// Follows the Lima pattern: `52:55:55:xx:xx:xx` prefix (locally administered).
+/// Delegates to [`MacAddress::deterministic`] and returns the string form.
 ///
 /// # Example
 /// ```
@@ -67,26 +65,7 @@ fn parse_mac_address(mac: &str) -> Result<Retained<VZMACAddress>, KasouError> {
 /// assert!(mac.starts_with("52:55:55:"));
 /// ```
 pub fn deterministic_mac(unique_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    // Use a hash of the hostname + unique_id for determinism.
-    // Not cryptographic, but sufficient for MAC uniqueness.
-    let mut hasher = DefaultHasher::new();
-    if let Ok(hostname) = std::env::var("HOSTNAME")
-        .or_else(|_| hostname::get().map(|h| h.to_string_lossy().into_owned()))
-    {
-        hostname.hash(&mut hasher);
-    }
-    unique_id.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let bytes = hash.to_le_bytes();
-    // 52:55:55 prefix — locally administered, same convention as Lima
-    format!(
-        "52:55:55:{:02x}:{:02x}:{:02x}",
-        bytes[0], bytes[1], bytes[2]
-    )
+    crate::types::MacAddress::deterministic(unique_id).to_string()
 }
 
 #[cfg(test)]
@@ -94,16 +73,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_mac_address() {
-        let config = NetworkConfig {
-            mac_address: Some("5a:94:ef:ab:cd:12".to_string()),
-        };
-        // This test requires macOS with Virtualization.framework
-        // On CI without macOS, it will fail at the VZ call level
-        let result = create_network_device(&config);
-        // We can't easily assert success without the framework,
-        // but the parsing logic is correct
-        assert!(result.is_ok() || result.is_err());
+    fn valid_mac_address_parses() {
+        // Test the MAC parsing logic directly (no VZ framework needed)
+        let result = parse_mac_address("5a:94:ef:ab:cd:12");
+        assert!(result.is_ok());
     }
 
     #[test]

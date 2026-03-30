@@ -10,7 +10,7 @@ use objc2_virtualization::{
 use crate::KasouError;
 
 /// Configuration for sharing a host directory with the guest via virtiofs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SharedDirConfig {
     /// Tag used by the guest to mount this share (e.g. "share0").
     pub tag: String,

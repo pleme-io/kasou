@@ -18,7 +18,7 @@ use crate::KasouError;
 ///
 /// Mirrors the parameters that vfkit accepts on its command line,
 /// but with full MAC address control at the hypervisor level.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VmConfig {
     /// Number of virtual CPUs.
     pub cpus: u32,

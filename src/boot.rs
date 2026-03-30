@@ -8,7 +8,7 @@ use objc2_virtualization::VZLinuxBootLoader;
 use crate::KasouError;
 
 /// Configuration for direct Linux kernel boot.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BootConfig {
     /// Path to the Linux kernel image.
     pub kernel: std::path::PathBuf,

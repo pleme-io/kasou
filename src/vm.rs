@@ -144,9 +144,20 @@ impl Drop for VmHandle {
     fn drop(&mut self) {
         let state = *self.state_rx.borrow();
         if state.is_active() {
-            tracing::warn!(state = %state, "VmHandle dropped while VM active, requesting stop");
-            let _ = unsafe { self.vm.0.requestStopWithError() };
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            tracing::warn!(state = %state, "VmHandle dropped while VM active, forcing hard stop");
+            // Hard stop via the dispatch queue — safe because exec_sync
+            // blocks until the queue drains, ensuring the VM is stopped
+            // before VmHandle fields are deallocated.
+            let vm_addr = &*self.vm.0 as *const VZVirtualMachine as usize;
+            self.queue.exec_sync(move || {
+                let vm_ptr = vm_addr as *const VZVirtualMachine;
+                // SAFETY: on the VM's serial queue, pointer valid (we're in Drop,
+                // self still alive during this call).
+                let block = RcBlock::new(|_error: *mut NSError| {});
+                unsafe { (*vm_ptr).stopWithCompletionHandler(&block) };
+            });
+            // Brief wait for the hard stop to take effect
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 }
@@ -177,6 +188,46 @@ fn dispatch_vz_op(
 
         let vm_ptr = vm_addr as *const VZVirtualMachine;
         call(vm_ptr, &block);
+    });
+
+    rx.recv().map_err(|_| KasouError::QueueCancelled)?
+}
+
+/// Helper: dispatch a VZ URL-based operation (save/restore) on the queue.
+/// The URL is created on the dispatch queue thread, avoiding lifetime issues.
+fn dispatch_vz_url_op(
+    queue: &DispatchQueue,
+    vm_addr: usize,
+    path: &Path,
+    op_name: &'static str,
+    call: fn(*const VZVirtualMachine, *const NSURL, &block2::DynBlock<dyn Fn(*mut NSError)>),
+) -> Result<(), KasouError> {
+    let path_string = path.to_str().ok_or_else(|| {
+        KasouError::InvalidConfig(format!("path not UTF-8: {}", path.display()))
+    })?.to_string();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    queue.exec_async(move || {
+        // Create NSURL on the dispatch queue thread — no cross-thread lifetime issues
+        let ns_path = NSString::from_str(&path_string);
+        let url = NSURL::initFileURLWithPath(NSURL::alloc(), &ns_path);
+
+        let tx = Cell::new(Some(tx));
+        let block = RcBlock::new(move |error: *mut NSError| {
+            let result = if error.is_null() {
+                Ok(())
+            } else {
+                let desc = unsafe { (*error).localizedDescription() }.to_string();
+                Err(KasouError::OperationFailed(format!("{op_name} failed: {desc}")))
+            };
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(result);
+            }
+        });
+
+        let vm_ptr = vm_addr as *const VZVirtualMachine;
+        call(vm_ptr, &*url as *const NSURL, &block);
     });
 
     rx.recv().map_err(|_| KasouError::QueueCancelled)?
@@ -259,41 +310,9 @@ impl VmHandle {
     /// The VM remains in Paused state after saving. The state file can be
     /// used later to restore the VM to this exact point.
     pub fn save_state(&self, path: &Path) -> Result<(), KasouError> {
-        let path_str = path.to_str().ok_or_else(|| {
-            KasouError::InvalidConfig(format!("path not UTF-8: {}", path.display()))
-        })?;
-        let ns_path = NSString::from_str(path_str);
-        let url = NSURL::initFileURLWithPath(NSURL::alloc(), &ns_path);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let vm_addr = self.vm_addr();
-        // URL must be moved into the closure — convert to raw pointer
-        let url_addr = &*url as *const NSURL as usize;
-        // Keep url alive until operation completes
-        let _url_retain = url;
-
-        self.queue.exec_async(move || {
-            let tx = Cell::new(Some(tx));
-            let block = RcBlock::new(move |error: *mut NSError| {
-                let result = if error.is_null() {
-                    Ok(())
-                } else {
-                    let desc = unsafe { (*error).localizedDescription() }.to_string();
-                    Err(KasouError::OperationFailed(format!("save failed: {desc}")))
-                };
-                if let Some(tx) = tx.take() {
-                    let _ = tx.send(result);
-                }
-            });
-
-            let vm_ptr = vm_addr as *const VZVirtualMachine;
-            let url_ptr = url_addr as *const NSURL;
-            unsafe {
-                (*vm_ptr).saveMachineStateToURL_completionHandler(&*url_ptr, &block);
-            };
-        });
-
-        rx.recv().map_err(|_| KasouError::QueueCancelled)?
+        dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "save", |vm, url, block| {
+            unsafe { (*vm).saveMachineStateToURL_completionHandler(&*url, block) };
+        })
     }
 
     /// Restore VM state from a file (macOS 14+).
@@ -301,47 +320,29 @@ impl VmHandle {
     /// The VM must be in Stopped state. After restoring, the VM will be
     /// in Paused state (ready to resume).
     pub fn restore_state(&self, path: &Path) -> Result<(), KasouError> {
-        let path_str = path.to_str().ok_or_else(|| {
-            KasouError::InvalidConfig(format!("path not UTF-8: {}", path.display()))
-        })?;
-        let ns_path = NSString::from_str(path_str);
-        let url = NSURL::initFileURLWithPath(NSURL::alloc(), &ns_path);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let vm_addr = self.vm_addr();
-        let url_addr = &*url as *const NSURL as usize;
-        let _url_retain = url;
-
-        self.queue.exec_async(move || {
-            let tx = Cell::new(Some(tx));
-            let block = RcBlock::new(move |error: *mut NSError| {
-                let result = if error.is_null() {
-                    Ok(())
-                } else {
-                    let desc = unsafe { (*error).localizedDescription() }.to_string();
-                    Err(KasouError::OperationFailed(format!("restore failed: {desc}")))
-                };
-                if let Some(tx) = tx.take() {
-                    let _ = tx.send(result);
-                }
-            });
-
-            let vm_ptr = vm_addr as *const VZVirtualMachine;
-            let url_ptr = url_addr as *const NSURL;
-            unsafe {
-                (*vm_ptr).restoreMachineStateFromURL_completionHandler(&*url_ptr, &block);
-            };
-        });
-
-        rx.recv().map_err(|_| KasouError::QueueCancelled)?
+        dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "restore", |vm, url, block| {
+            unsafe { (*vm).restoreMachineStateFromURL_completionHandler(&*url, block) };
+        })
     }
 
     /// Request the guest to stop (graceful ACPI power button).
+    ///
+    /// Dispatched through the serial queue to maintain the Send safety invariant.
+    /// The guest may ignore this — callers should implement timeout escalation.
     pub fn request_stop(&self) -> Result<(), KasouError> {
-        unsafe { self.vm.0.requestStopWithError() }.map_err(|e| {
-            let desc = e.localizedDescription().to_string();
-            KasouError::OperationFailed(format!("request stop failed: {desc}"))
-        })
+        let (tx, rx) = std::sync::mpsc::channel();
+        let vm_addr = self.vm_addr();
+
+        self.queue.exec_async(move || {
+            let vm_ptr = vm_addr as *const VZVirtualMachine;
+            let result = unsafe { (*vm_ptr).requestStopWithError() }.map_err(|e| {
+                let desc = e.localizedDescription().to_string();
+                KasouError::OperationFailed(format!("request stop failed: {desc}"))
+            });
+            let _ = tx.send(result);
+        });
+
+        rx.recv().map_err(|_| KasouError::QueueCancelled)?
     }
 
     /// Get the current VM state.
