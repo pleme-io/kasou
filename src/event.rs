@@ -84,3 +84,47 @@ impl Default for VmEventBus {
         Self::new(256)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::VmId;
+    use crate::vm::VmState;
+
+    #[test]
+    fn event_bus_emits_to_subscriber() {
+        let bus = VmEventBus::default();
+        let mut rx = bus.subscribe();
+
+        bus.state_changed(VmId::from("test-vm"), VmState::Stopped, VmState::Running);
+
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.vm_id, VmId::from("test-vm"));
+        match event.kind {
+            VmEventKind::StateChanged { from, to } => {
+                assert_eq!(from, VmState::Stopped);
+                assert_eq!(to, VmState::Running);
+            }
+            other => panic!("expected StateChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_bus_no_subscribers_does_not_panic() {
+        let bus = VmEventBus::default();
+        // Emitting with no subscribers should not panic
+        bus.state_changed(VmId::from("x"), VmState::Running, VmState::Stopped);
+    }
+
+    #[test]
+    fn event_bus_multiple_subscribers() {
+        let bus = VmEventBus::default();
+        let mut rx1 = bus.subscribe();
+        let mut rx2 = bus.subscribe();
+
+        bus.state_changed(VmId::from("vm"), VmState::Running, VmState::Paused);
+
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+    }
+}

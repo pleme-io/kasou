@@ -283,16 +283,22 @@ impl VmHandle {
 
     /// Start the virtual machine.
     pub fn start(&self) -> Result<(), KasouError> {
+        let before = self.state();
         dispatch_vz_op(&self.queue, self.vm_addr(), "start", |vm, block| {
             unsafe { (*vm).startWithCompletionHandler(block) };
-        })
+        })?;
+        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Running });
+        Ok(())
     }
 
     /// Hard stop the virtual machine (destructive).
     pub fn stop(&self) -> Result<(), KasouError> {
+        let before = self.state();
         dispatch_vz_op(&self.queue, self.vm_addr(), "stop", |vm, block| {
             unsafe { (*vm).stopWithCompletionHandler(block) };
-        })
+        })?;
+        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Stopped });
+        Ok(())
     }
 
     /// Pause the virtual machine (VZ native, zero CPU usage).
@@ -300,16 +306,22 @@ impl VmHandle {
     /// The VM must be in Running state. After pausing, the VM can be
     /// resumed, saved to disk, or stopped.
     pub fn pause(&self) -> Result<(), KasouError> {
+        let before = self.state();
         dispatch_vz_op(&self.queue, self.vm_addr(), "pause", |vm, block| {
             unsafe { (*vm).pauseWithCompletionHandler(block) };
-        })
+        })?;
+        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Paused });
+        Ok(())
     }
 
     /// Resume a paused virtual machine.
     pub fn resume(&self) -> Result<(), KasouError> {
+        let before = self.state();
         dispatch_vz_op(&self.queue, self.vm_addr(), "resume", |vm, block| {
             unsafe { (*vm).resumeWithCompletionHandler(block) };
-        })
+        })?;
+        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Running });
+        Ok(())
     }
 
     /// Save VM state to a file (macOS 14+, requires VM to be paused).
@@ -319,7 +331,9 @@ impl VmHandle {
     pub fn save_state(&self, path: &Path) -> Result<(), KasouError> {
         dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "save", |vm, url, block| {
             unsafe { (*vm).saveMachineStateToURL_completionHandler(&*url, block) };
-        })
+        })?;
+        self.emit(VmEventKind::SnapshotCreated { path: path.to_path_buf() });
+        Ok(())
     }
 
     /// Restore VM state from a file (macOS 14+).
@@ -329,7 +343,9 @@ impl VmHandle {
     pub fn restore_state(&self, path: &Path) -> Result<(), KasouError> {
         dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "restore", |vm, url, block| {
             unsafe { (*vm).restoreMachineStateFromURL_completionHandler(&*url, block) };
-        })
+        })?;
+        self.emit(VmEventKind::SnapshotRestored { path: path.to_path_buf() });
+        Ok(())
     }
 
     /// Request the guest to stop (graceful ACPI power button).
@@ -349,7 +365,11 @@ impl VmHandle {
             let _ = tx.send(result);
         });
 
-        rx.recv().map_err(|_| KasouError::QueueCancelled)?
+        let result = rx.recv().map_err(|_| KasouError::QueueCancelled)?;
+        if result.is_ok() {
+            self.emit(VmEventKind::ShutdownRequested);
+        }
+        result
     }
 
     /// Get the current VM state.
@@ -398,5 +418,94 @@ impl VmHandle {
             vm_id: self.config.id.clone(),
             kind,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- VmState transition table ---
+
+    #[test]
+    fn stopped_can_start() {
+        assert!(VmState::Stopped.can_transition_to(VmState::Starting));
+    }
+
+    #[test]
+    fn starting_reaches_running() {
+        assert!(VmState::Starting.can_transition_to(VmState::Running));
+    }
+
+    #[test]
+    fn running_can_pause_stop() {
+        assert!(VmState::Running.can_transition_to(VmState::Pausing));
+        assert!(VmState::Running.can_transition_to(VmState::Stopping));
+        assert!(VmState::Running.can_transition_to(VmState::Stopped)); // guest-initiated
+    }
+
+    #[test]
+    fn pause_resume_cycle() {
+        assert!(VmState::Running.can_transition_to(VmState::Pausing));
+        assert!(VmState::Pausing.can_transition_to(VmState::Paused));
+        assert!(VmState::Paused.can_transition_to(VmState::Resuming));
+        assert!(VmState::Resuming.can_transition_to(VmState::Running));
+    }
+
+    #[test]
+    fn save_restore_cycle() {
+        assert!(VmState::Paused.can_transition_to(VmState::Saving));
+        assert!(VmState::Saving.can_transition_to(VmState::Paused));
+        assert!(VmState::Stopped.can_transition_to(VmState::Restoring));
+        assert!(VmState::Restoring.can_transition_to(VmState::Paused));
+    }
+
+    #[test]
+    fn error_from_any_active() {
+        for state in [
+            VmState::Starting, VmState::Running, VmState::Pausing,
+            VmState::Paused, VmState::Resuming, VmState::Stopping,
+            VmState::Saving, VmState::Restoring,
+        ] {
+            assert!(state.can_transition_to(VmState::Error), "{state} should reach Error");
+        }
+    }
+
+    #[test]
+    fn error_is_terminal() {
+        assert!(VmState::Error.is_terminal());
+        assert!(!VmState::Stopped.is_terminal());
+        assert!(!VmState::Running.is_terminal());
+    }
+
+    #[test]
+    fn invalid_transitions_rejected() {
+        assert!(!VmState::Stopped.can_transition_to(VmState::Running)); // must go through Starting
+        assert!(!VmState::Running.can_transition_to(VmState::Starting));
+        assert!(!VmState::Error.can_transition_to(VmState::Running));
+        assert!(!VmState::Error.can_transition_to(VmState::Stopped));
+    }
+
+    #[test]
+    fn active_states() {
+        assert!(VmState::Running.is_active());
+        assert!(VmState::Paused.is_active());
+        assert!(VmState::Saving.is_active());
+        assert!(VmState::Restoring.is_active());
+        assert!(!VmState::Stopped.is_active());
+        assert!(!VmState::Error.is_active());
+    }
+
+    #[test]
+    fn display_round_trip() {
+        for state in [
+            VmState::Stopped, VmState::Starting, VmState::Running,
+            VmState::Pausing, VmState::Paused, VmState::Resuming,
+            VmState::Stopping, VmState::Saving, VmState::Restoring,
+            VmState::Error,
+        ] {
+            let s = state.to_string();
+            assert!(!s.is_empty(), "display should not be empty for {state:?}");
+        }
     }
 }
