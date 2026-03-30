@@ -398,16 +398,45 @@ impl VmHandle {
     }
 
     /// Get runtime information about this VM.
+    ///
+    /// Includes IP address from DHCP lease lookup when a MAC is configured.
     pub fn info(&self) -> VmInfo {
         let uptime = self.created_at.elapsed().as_secs();
+        let mac_address = self.config.network.mac_address.as_ref()
+            .and_then(|m| crate::types::MacAddress::parse(m).ok());
+        let ip_address = self.config.network.mac_address.as_ref()
+            .and_then(|mac| crate::dhcp::lookup_ip_by_mac(mac));
         VmInfo {
             id: self.config.id.clone(),
             state: self.state(),
             pid: Some(std::process::id()),
             uptime_secs: Some(uptime),
-            mac_address: self.config.network.mac_address.as_ref()
-                .and_then(|m| crate::types::MacAddress::parse(m).ok()),
-            ip_address: None, // would need DHCP lease lookup
+            mac_address,
+            ip_address,
+        }
+    }
+
+    /// Wait for the VM to obtain an IP address via DHCP.
+    ///
+    /// Polls the macOS DHCP lease file at 1-second intervals until the
+    /// VM's MAC address appears with an assigned IP, or the timeout expires.
+    pub fn wait_for_ip(&self, timeout: std::time::Duration) -> Result<String, KasouError> {
+        let mac = self.config.network.mac_address.as_ref().ok_or_else(|| {
+            KasouError::InvalidConfig("no MAC address configured — cannot discover IP".into())
+        })?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(ip) = crate::dhcp::lookup_ip_by_mac(mac) {
+                self.emit(VmEventKind::IpAssigned { ip: ip.clone() });
+                return Ok(ip);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(KasouError::OperationFailed(format!(
+                    "VM did not obtain DHCP IP within {}s (MAC: {mac})",
+                    timeout.as_secs()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
 

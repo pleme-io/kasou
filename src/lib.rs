@@ -37,6 +37,7 @@
 mod boot;
 pub mod builder;
 mod config;
+pub mod dhcp;
 mod delegate;
 mod disk;
 mod error;

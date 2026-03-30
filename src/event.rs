@@ -39,6 +39,8 @@ pub enum VmEventKind {
     SnapshotCreated { path: PathBuf },
     /// Snapshot was restored.
     SnapshotRestored { path: PathBuf },
+    /// VM obtained an IP address via DHCP.
+    IpAssigned { ip: String },
     /// VM was force-stopped (Drop guard or hard stop).
     ForceStop,
 }
