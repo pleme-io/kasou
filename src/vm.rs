@@ -15,7 +15,10 @@ use crate::delegate::VmDelegate;
 use crate::KasouError;
 
 /// VM lifecycle state as observed from Rust.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// State machine follows Apple's `VZVirtualMachineState` with validated transitions.
+/// The Error state is **terminal** — the VM must be recreated, not recovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VmState {
     Stopped,
     Starting,
@@ -48,6 +51,45 @@ impl VmState {
             self,
             Self::Starting | Self::Running | Self::Pausing | Self::Paused | Self::Resuming
         )
+    }
+
+    /// Whether a transition to the target state is valid.
+    ///
+    /// Follows the VZ framework state machine:
+    /// - Stopped → Starting → Running
+    /// - Running → Pausing → Paused → Resuming → Running
+    /// - Running/Paused → Stopping → Stopped
+    /// - Any → Error (terminal, VM must be recreated)
+    #[allow(clippy::match_like_matches_macro)]
+    pub fn can_transition_to(self, target: Self) -> bool {
+        matches!(
+            (self, target),
+            // Normal lifecycle
+            (Self::Stopped, Self::Starting)
+            | (Self::Starting, Self::Running)
+            | (Self::Running, Self::Pausing)
+            | (Self::Pausing, Self::Paused)
+            | (Self::Paused, Self::Resuming)
+            | (Self::Resuming, Self::Running)
+            // Shutdown paths
+            | (Self::Running, Self::Stopping)
+            | (Self::Paused, Self::Stopping)
+            | (Self::Stopping, Self::Stopped)
+            // Guest-initiated stop (delegate callback)
+            | (Self::Running, Self::Stopped)
+            // Error from any active state
+            | (Self::Starting, Self::Error)
+            | (Self::Running, Self::Error)
+            | (Self::Pausing, Self::Error)
+            | (Self::Paused, Self::Error)
+            | (Self::Resuming, Self::Error)
+            | (Self::Stopping, Self::Error)
+        )
+    }
+
+    /// Whether this is a terminal state (VM cannot be restarted).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Error)
     }
 }
 
