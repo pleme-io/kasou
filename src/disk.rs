@@ -3,7 +3,10 @@ use std::path::Path;
 use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSString, NSURL};
-use objc2_virtualization::{VZDiskImageStorageDeviceAttachment, VZVirtioBlockDeviceConfiguration};
+use objc2_virtualization::{
+    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment,
+    VZDiskImageSynchronizationMode, VZVirtioBlockDeviceConfiguration,
+};
 
 use crate::KasouError;
 
@@ -25,13 +28,16 @@ pub(crate) fn create_storage_device(
 
     let url = path_to_nsurl(&config.path)?;
 
-    // SAFETY: Creates a disk image attachment from a file URL.
-    // Returns an error via NSError if the file cannot be opened.
+    // Use explicit cached + full sync to prevent EXT4 filesystem corruption
+    // in Linux guests. The default .automatic mode is known to corrupt ext4.
+    // See: https://github.com/utmapp/UTM/pull/5919
     let attachment = unsafe {
-        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
             VZDiskImageStorageDeviceAttachment::alloc(),
             &url,
             config.read_only,
+            VZDiskImageCachingMode::Cached,
+            VZDiskImageSynchronizationMode::Full,
         )
     }
     .map_err(|e| {
@@ -42,7 +48,6 @@ pub(crate) fn create_storage_device(
         ))
     })?;
 
-    // SAFETY: Creates a virtio block device from a valid storage attachment.
     let device = unsafe {
         VZVirtioBlockDeviceConfiguration::initWithAttachment(
             VZVirtioBlockDeviceConfiguration::alloc(),
@@ -58,8 +63,6 @@ fn path_to_nsurl(path: &Path) -> Result<Retained<NSURL>, KasouError> {
         KasouError::InvalidConfig(format!("path is not valid UTF-8: {}", path.display()))
     })?;
     let ns_path = NSString::from_str(path_str);
-
-    // SAFETY: initFileURLWithPath creates a file URL from a filesystem path string.
     let url = NSURL::initFileURLWithPath(NSURL::alloc(), &ns_path);
     Ok(url)
 }

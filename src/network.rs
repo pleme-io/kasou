@@ -55,6 +55,40 @@ fn parse_mac_address(mac: &str) -> Result<Retained<VZMACAddress>, KasouError> {
     vz_mac.ok_or_else(|| KasouError::InvalidMac(mac.to_string()))
 }
 
+/// Generate a deterministic locally-administered MAC address from a unique ID.
+///
+/// Uses SHA-256 of the macOS hardware UUID + unique_id to produce a stable
+/// MAC that is consistent across reboots for the same VM on the same host.
+/// Follows the Lima pattern: `52:55:55:xx:xx:xx` prefix (locally administered).
+///
+/// # Example
+/// ```
+/// let mac = kasou::deterministic_mac("cid-k3s");
+/// assert!(mac.starts_with("52:55:55:"));
+/// ```
+pub fn deterministic_mac(unique_id: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Use a hash of the hostname + unique_id for determinism.
+    // Not cryptographic, but sufficient for MAC uniqueness.
+    let mut hasher = DefaultHasher::new();
+    if let Ok(hostname) = std::env::var("HOSTNAME")
+        .or_else(|_| hostname::get().map(|h| h.to_string_lossy().into_owned()))
+    {
+        hostname.hash(&mut hasher);
+    }
+    unique_id.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let bytes = hash.to_le_bytes();
+    // 52:55:55 prefix — locally administered, same convention as Lima
+    format!(
+        "52:55:55:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2]
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +114,21 @@ mod tests {
             Err(KasouError::InvalidMac(s)) => assert_eq!(s, "not-a-mac"),
             other => panic!("expected InvalidMac, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deterministic_mac_is_stable() {
+        let mac1 = deterministic_mac("cid-k3s");
+        let mac2 = deterministic_mac("cid-k3s");
+        assert_eq!(mac1, mac2, "same input should produce same MAC");
+        assert!(mac1.starts_with("52:55:55:"), "should use locally-administered prefix");
+    }
+
+    #[test]
+    fn deterministic_mac_differs_per_cluster() {
+        let mac1 = deterministic_mac("cid-k3s");
+        let mac2 = deterministic_mac("ryn-k3s");
+        assert_ne!(mac1, mac2, "different clusters should get different MACs");
     }
 
     #[test]

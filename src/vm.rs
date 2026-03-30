@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
 use block2::RcBlock;
@@ -40,6 +41,14 @@ impl VmState {
             _ => Self::Error,
         }
     }
+
+    /// Whether this state represents a running VM that needs cleanup.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::Pausing | Self::Paused | Self::Resuming
+        )
+    }
 }
 
 impl std::fmt::Display for VmState {
@@ -65,22 +74,16 @@ impl std::fmt::Display for VmState {
 struct SendVm(Retained<VZVirtualMachine>);
 unsafe impl Send for SendVm {}
 
-/// Send-safe raw pointer to VZVirtualMachine for dispatch queue closures.
-///
-/// SAFETY: The pointer is valid for the lifetime of the owning VmHandle.
-/// All access happens on the VM's serial dispatch queue.
-struct SendVmPtr(*const VZVirtualMachine);
-unsafe impl Send for SendVmPtr {}
-
 /// Handle to a virtual machine.
 ///
 /// Owns the `VZVirtualMachine` instance, its dedicated dispatch queue, and
-/// the delegate. VM operations call the framework API directly — the
-/// framework dispatches to the VM's queue internally. Completions are
-/// bridged back via `std::sync::mpsc` channels.
+/// the delegate. VM operations are dispatched to the serial queue via
+/// `exec_async` with raw pointer bridging. Completions return via `mpsc`.
+///
+/// Implements `Drop` to force-stop active VMs, preventing orphaned processes.
 pub struct VmHandle {
     vm: SendVm,
-    _queue: DispatchRetained<DispatchQueue>,
+    queue: DispatchRetained<DispatchQueue>,
     _delegate: Retained<VmDelegate>,
     state_rx: watch::Receiver<VmState>,
 }
@@ -88,6 +91,19 @@ pub struct VmHandle {
 // SAFETY: VmHandle is Send because the framework serializes all VM access
 // through its internal dispatch queue.
 unsafe impl Send for VmHandle {}
+
+impl Drop for VmHandle {
+    fn drop(&mut self) {
+        let state = *self.state_rx.borrow();
+        if state.is_active() {
+            tracing::warn!(state = %state, "VmHandle dropped while VM active, requesting stop");
+            // request_stop is sync and lightweight — safe in Drop
+            let _ = unsafe { self.vm.0.requestStopWithError() };
+            // Give guest a brief moment to respond to ACPI power button
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+}
 
 impl VmHandle {
     /// Create a new VM from configuration.
@@ -106,13 +122,10 @@ impl VmHandle {
         let state_tx = Arc::new(state_tx);
         let delegate = VmDelegate::new(Arc::clone(&state_tx));
 
-        // Create a dedicated serial dispatch queue for this VM.
-        // The framework dispatches all VM operations and delegate callbacks here.
         let queue = DispatchQueue::new("io.pleme.kasou.vm", None);
 
         tracing::info!("creating VZVirtualMachine with dedicated dispatch queue");
         // SAFETY: initWithConfiguration_queue creates a VM bound to our serial queue.
-        // The configuration has been validated via validateWithError in build_vz_config.
         let vm = unsafe {
             VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
@@ -129,7 +142,7 @@ impl VmHandle {
 
         Ok(Self {
             vm: SendVm(vm),
-            _queue: queue,
+            queue,
             _delegate: delegate,
             state_rx,
         })
@@ -137,17 +150,18 @@ impl VmHandle {
 
     /// Start the virtual machine.
     ///
-    /// Calls `startWithCompletionHandler:` — the framework dispatches to the
-    /// VM's queue internally. Blocks the calling thread until completion.
+    /// Dispatches `startWithCompletionHandler:` on the VM's serial queue.
+    /// Blocks the calling thread until the completion handler fires.
     pub fn start(&self) -> Result<(), KasouError> {
         let (tx, rx) = std::sync::mpsc::channel();
-        // Cast pointer to usize (which is Send) to move into the closure.
-        // SAFETY: the pointer is valid for the lifetime of VmHandle, and
-        // we block on rx.recv() below, so VmHandle cannot be dropped.
+        // Cast to usize (Send) to move into the exec_async closure.
+        // SAFETY: pointer valid for VmHandle lifetime; rx.recv() blocks
+        // so the handle cannot be dropped before the operation completes.
         let vm_addr = &*self.vm.0 as *const VZVirtualMachine as usize;
 
-        self._queue.exec_async(move || {
-            let tx = std::sync::Mutex::new(Some(tx));
+        self.queue.exec_async(move || {
+            // Cell instead of Mutex — serial queue guarantees single-thread access
+            let tx = Cell::new(Some(tx));
             let block = RcBlock::new(move |error: *mut NSError| {
                 let result = if error.is_null() {
                     Ok(())
@@ -155,12 +169,13 @@ impl VmHandle {
                     let desc = unsafe { (*error).localizedDescription() }.to_string();
                     Err(KasouError::OperationFailed(format!("start failed: {desc}")))
                 };
-                if let Some(tx) = tx.lock().unwrap().take() {
+                if let Some(tx) = tx.take() {
                     let _ = tx.send(result);
                 }
             });
 
             let vm_ptr = vm_addr as *const VZVirtualMachine;
+            // SAFETY: on the VM's serial queue as required by the framework.
             unsafe { (*vm_ptr).startWithCompletionHandler(&block) };
         });
 
@@ -170,13 +185,13 @@ impl VmHandle {
     /// Stop the virtual machine (hard stop).
     ///
     /// Destructive — the guest does not get a chance to shut down cleanly.
-    /// Use `request_stop()` for graceful shutdown.
+    /// Use `request_stop()` for graceful shutdown with timeout escalation.
     pub fn stop(&self) -> Result<(), KasouError> {
         let (tx, rx) = std::sync::mpsc::channel();
         let vm_addr = &*self.vm.0 as *const VZVirtualMachine as usize;
 
-        self._queue.exec_async(move || {
-            let tx = std::sync::Mutex::new(Some(tx));
+        self.queue.exec_async(move || {
+            let tx = Cell::new(Some(tx));
             let block = RcBlock::new(move |error: *mut NSError| {
                 let result = if error.is_null() {
                     Ok(())
@@ -184,7 +199,7 @@ impl VmHandle {
                     let desc = unsafe { (*error).localizedDescription() }.to_string();
                     Err(KasouError::OperationFailed(format!("stop failed: {desc}")))
                 };
-                if let Some(tx) = tx.lock().unwrap().take() {
+                if let Some(tx) = tx.take() {
                     let _ = tx.send(result);
                 }
             });
@@ -197,8 +212,10 @@ impl VmHandle {
     }
 
     /// Request the guest to stop (graceful shutdown via ACPI power button).
+    ///
+    /// The guest may ignore this. Callers should implement a timeout and
+    /// escalate to `stop()` (hard stop) if the guest doesn't respond.
     pub fn request_stop(&self) -> Result<(), KasouError> {
-        // SAFETY: requestStopWithError sends a power button event to the guest.
         unsafe { self.vm.0.requestStopWithError() }.map_err(|e| {
             let desc = e.localizedDescription().to_string();
             KasouError::OperationFailed(format!("request stop failed: {desc}"))

@@ -32,7 +32,7 @@ pub use boot::BootConfig;
 pub use config::VmConfig;
 pub use disk::DiskConfig;
 pub use error::KasouError;
-pub use network::NetworkConfig;
+pub use network::{deterministic_mac, NetworkConfig};
 pub use serial::SerialConfig;
 pub use shared_dir::SharedDirConfig;
 pub use vm::{VmHandle, VmState};
