@@ -32,14 +32,38 @@ use crate::shared_dir::SharedDirConfig;
 use crate::types::{MacAddress, VmId};
 use crate::KasouError;
 
+/// Internal builder mode — Linux direct boot (default) or EFI boot.
+/// Callers flip to EFI via `.efi_boot()`.
+#[derive(Debug, Clone)]
+enum BootMode {
+    /// Linux direct boot accumulator. Default.
+    Linux {
+        kernel: Option<PathBuf>,
+        initrd: Option<PathBuf>,
+        cmdline: Option<String>,
+    },
+    /// EFI firmware boot accumulator.
+    Efi {
+        variable_store: Option<PathBuf>,
+    },
+}
+
+impl Default for BootMode {
+    fn default() -> Self {
+        Self::Linux {
+            kernel: None,
+            initrd: None,
+            cmdline: None,
+        }
+    }
+}
+
 /// Builder for constructing `VmConfig` with a fluent API.
 pub struct VmConfigBuilder {
     id: VmId,
     cpus: u32,
     memory_mib: u64,
-    kernel: Option<PathBuf>,
-    initrd: Option<PathBuf>,
-    cmdline: Option<String>,
+    boot_mode: BootMode,
     disks: Vec<DiskConfig>,
     mac: Option<String>,
     serial: Option<SerialConfig>,
@@ -53,9 +77,7 @@ impl VmConfigBuilder {
             id: id.into(),
             cpus: 2,
             memory_mib: 2048,
-            kernel: None,
-            initrd: None,
-            cmdline: None,
+            boot_mode: BootMode::default(),
             disks: Vec::new(),
             mac: None,
             serial: None,
@@ -75,21 +97,78 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Set the kernel path for direct Linux boot.
+    /// Set the kernel path for direct Linux boot. Implicitly selects Linux
+    /// boot mode; fails later at `build()` if combined with EFI-only fields.
     pub fn boot(mut self, kernel: PathBuf) -> Self {
-        self.kernel = Some(kernel);
+        self.boot_mode = match self.boot_mode {
+            BootMode::Linux { initrd, cmdline, .. } => BootMode::Linux {
+                kernel: Some(kernel),
+                initrd,
+                cmdline,
+            },
+            BootMode::Efi { .. } => BootMode::Linux {
+                kernel: Some(kernel),
+                initrd: None,
+                cmdline: None,
+            },
+        };
         self
     }
 
     /// Set the initrd path (order-independent — can be called before or after `boot()`).
     pub fn initrd(mut self, initrd: PathBuf) -> Self {
-        self.initrd = Some(initrd);
+        self.boot_mode = match self.boot_mode {
+            BootMode::Linux { kernel, cmdline, .. } => BootMode::Linux {
+                kernel,
+                initrd: Some(initrd),
+                cmdline,
+            },
+            BootMode::Efi { .. } => BootMode::Linux {
+                kernel: None,
+                initrd: Some(initrd),
+                cmdline: None,
+            },
+        };
         self
     }
 
     /// Set the kernel command line (order-independent).
     pub fn cmdline(mut self, cmdline: impl Into<String>) -> Self {
-        self.cmdline = Some(cmdline.into());
+        self.boot_mode = match self.boot_mode {
+            BootMode::Linux { kernel, initrd, .. } => BootMode::Linux {
+                kernel,
+                initrd,
+                cmdline: Some(cmdline.into()),
+            },
+            BootMode::Efi { .. } => BootMode::Linux {
+                kernel: None,
+                initrd: None,
+                cmdline: Some(cmdline.into()),
+            },
+        };
+        self
+    }
+
+    /// Switch the builder into EFI boot mode. The boot disk is added via
+    /// `.disk(…)` like any other disk; the EFI firmware scans the disk set
+    /// and boots the first EFI-bootable image. No separate kernel/initrd is
+    /// needed on the host side.
+    ///
+    /// Use `.efi_variable_store(…)` to persist EFI variables across boots.
+    pub fn efi_boot(mut self) -> Self {
+        self.boot_mode = match self.boot_mode {
+            BootMode::Efi { variable_store } => BootMode::Efi { variable_store },
+            BootMode::Linux { .. } => BootMode::Efi { variable_store: None },
+        };
+        self
+    }
+
+    /// Persist EFI variables (including Secure Boot state and boot-order
+    /// preferences) to `path` across boots. Implies EFI boot mode.
+    pub fn efi_variable_store(mut self, path: PathBuf) -> Self {
+        self.boot_mode = BootMode::Efi {
+            variable_store: Some(path),
+        };
         self
     }
 
@@ -152,16 +231,21 @@ impl VmConfigBuilder {
 
     /// Build the `VmConfig`, validating all required fields.
     pub fn build(self) -> Result<VmConfig, KasouError> {
-        let kernel = self.kernel.ok_or_else(|| {
-            KasouError::Validation("kernel path is required (call .boot())".into())
-        })?;
-        let initrd = self.initrd.ok_or_else(|| {
-            KasouError::Validation("initrd path is required (call .initrd())".into())
-        })?;
-        let boot = BootConfig {
-            kernel,
-            initrd,
-            cmdline: self.cmdline.unwrap_or_default(),
+        let boot = match self.boot_mode {
+            BootMode::Linux { kernel, initrd, cmdline } => {
+                let kernel = kernel.ok_or_else(|| {
+                    KasouError::Validation("kernel path is required (call .boot())".into())
+                })?;
+                let initrd = initrd.ok_or_else(|| {
+                    KasouError::Validation("initrd path is required (call .initrd())".into())
+                })?;
+                BootConfig::Linux {
+                    kernel,
+                    initrd,
+                    cmdline: cmdline.unwrap_or_default(),
+                }
+            }
+            BootMode::Efi { variable_store } => BootConfig::Efi { variable_store },
         };
 
         let config = VmConfig {
@@ -216,9 +300,49 @@ mod tests {
             .boot(PathBuf::from("/kernel"))
             .disk(PathBuf::from("/disk.img"));
 
-        assert!(builder.kernel.is_some());
-        assert!(builder.initrd.is_some());
-        assert!(builder.cmdline.is_some());
+        match &builder.boot_mode {
+            BootMode::Linux { kernel, initrd, cmdline } => {
+                assert!(kernel.is_some());
+                assert!(initrd.is_some());
+                assert!(cmdline.is_some());
+            }
+            BootMode::Efi { .. } => panic!("expected Linux mode"),
+        }
+    }
+
+    #[test]
+    fn builder_efi_mode_no_kernel_required() {
+        let config = VmConfigBuilder::new("brasa-test")
+            .cpus(2)
+            .memory_mib(1024)
+            .efi_boot()
+            .disk_readonly(PathBuf::from("/tmp/brasa.img"))
+            .build();
+        // Validation fails because the disk doesn't exist in the test env,
+        // but it fails at the *disk* check, not the kernel check — proving
+        // EFI mode doesn't require kernel/initrd.
+        match config {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("kernel") && !msg.contains("initrd"),
+                    "EFI mode should not require kernel/initrd, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builder_efi_variable_store_implies_efi_mode() {
+        let builder = VmConfigBuilder::new("test")
+            .efi_variable_store(PathBuf::from("/tmp/efi.vars"));
+        match &builder.boot_mode {
+            BootMode::Efi { variable_store: Some(p) } => {
+                assert_eq!(p, &PathBuf::from("/tmp/efi.vars"));
+            }
+            _ => panic!("expected Efi mode with variable store"),
+        }
     }
 
     #[test]
@@ -246,7 +370,7 @@ mod tests {
         assert_eq!(builder.cpus, 4);
         assert_eq!(builder.memory_mib, 8192);
         assert_eq!(builder.disks.len(), 2);
-        assert!(builder.kernel.is_some());
+        assert!(matches!(builder.boot_mode, BootMode::Linux { kernel: Some(_), .. }));
         assert!(builder.serial.is_some());
         assert_eq!(builder.shared_dirs.len(), 1);
     }

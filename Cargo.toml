@@ -51,6 +51,8 @@ objc2-virtualization = { version = "0.3", features = [
     "VZPlatformConfiguration",
     "VZVirtioEntropyDeviceConfiguration",
     "VZEntropyDeviceConfiguration",
+    "VZEFIBootLoader",
+    "VZEFIVariableStore",
 ] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

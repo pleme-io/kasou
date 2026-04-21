@@ -8,6 +8,8 @@ use objc2_virtualization::{
 };
 
 use crate::boot::{self, BootConfig};
+// `boot::setup_boot_loader` dispatches on the `BootConfig` variant and sets
+// the loader directly on `vz_config`; we no longer construct the loader here.
 use crate::disk::{self, DiskConfig};
 use crate::network::{self, NetworkConfig};
 use crate::serial::{self, SerialConfig};
@@ -51,17 +53,37 @@ impl VmConfig {
         if self.disks.is_empty() {
             return Err(KasouError::Validation("at least one disk is required".into()));
         }
-        if !self.boot.kernel.exists() {
-            return Err(KasouError::BootFilesNotFound(format!(
-                "kernel: {}",
-                self.boot.kernel.display()
-            )));
-        }
-        if !self.boot.initrd.exists() {
-            return Err(KasouError::BootFilesNotFound(format!(
-                "initrd: {}",
-                self.boot.initrd.display()
-            )));
+        match &self.boot {
+            BootConfig::Linux { kernel, initrd, .. } => {
+                if !kernel.exists() {
+                    return Err(KasouError::BootFilesNotFound(format!(
+                        "kernel: {}",
+                        kernel.display()
+                    )));
+                }
+                if !initrd.exists() {
+                    return Err(KasouError::BootFilesNotFound(format!(
+                        "initrd: {}",
+                        initrd.display()
+                    )));
+                }
+            }
+            BootConfig::Efi { variable_store } => {
+                // Variable-store presence is not a precondition — it's created
+                // on first boot if missing. The EFI boot disk is just one of
+                // `self.disks` and is validated in the disk loop below.
+                if let Some(store) = variable_store {
+                    // If a parent directory is specified, it must exist.
+                    if let Some(parent) = store.parent() {
+                        if !parent.as_os_str().is_empty() && !parent.exists() {
+                            return Err(KasouError::Validation(format!(
+                                "EFI variable store parent directory missing: {}",
+                                parent.display()
+                            )));
+                        }
+                    }
+                }
+            }
         }
         for disk in &self.disks {
             if !disk.path.exists() {
@@ -111,10 +133,8 @@ fn build_vz_config_inner(
     // SAFETY: setPlatform is valid with any VZPlatformConfiguration subclass.
     unsafe { vz_config.setPlatform(&platform) };
 
-    // Boot loader
-    let boot_loader = boot::create_boot_loader(&config.boot)?;
-    // SAFETY: setBootLoader is valid with any VZBootLoader subclass.
-    unsafe { vz_config.setBootLoader(Some(&boot_loader)) };
+    // Boot loader — dispatches on BootConfig variant (Linux vs EFI).
+    boot::setup_boot_loader(&config.boot, &vz_config)?;
 
     // Storage devices — collect as superclass refs for NSArray type compatibility
     let mut storage_devices = Vec::new();
@@ -189,7 +209,7 @@ mod tests {
             id: crate::types::VmId::default(),
             cpus: 0,
             memory_mib: 1024,
-            boot: BootConfig {
+            boot: BootConfig::Linux {
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 initrd: PathBuf::from("/nonexistent/initrd"),
                 cmdline: String::new(),
@@ -212,7 +232,7 @@ mod tests {
             id: crate::types::VmId::default(),
             cpus: 1,
             memory_mib: 0,
-            boot: BootConfig {
+            boot: BootConfig::Linux {
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 initrd: PathBuf::from("/nonexistent/initrd"),
                 cmdline: String::new(),
@@ -235,7 +255,7 @@ mod tests {
             id: crate::types::VmId::default(),
             cpus: 1,
             memory_mib: 1024,
-            boot: BootConfig {
+            boot: BootConfig::Linux {
                 kernel: PathBuf::from("/nonexistent/kernel"),
                 initrd: PathBuf::from("/nonexistent/initrd"),
                 cmdline: String::new(),

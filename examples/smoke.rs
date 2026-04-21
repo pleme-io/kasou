@@ -25,7 +25,7 @@ fn main() {
         id: kasou::VmId::from("smoke-test"),
         cpus: 2,
         memory_mib: 2048,
-        boot: kasou::BootConfig {
+        boot: kasou::BootConfig::Linux {
             kernel,
             initrd,
             cmdline: if let Some(ref init) = init {
