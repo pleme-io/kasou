@@ -157,7 +157,14 @@ unsafe impl Send for VmHandle {}
 impl Drop for VmHandle {
     fn drop(&mut self) {
         let state = *self.state_rx.borrow();
-        if state.is_active() {
+        // Skip force-stop on Paused — a paused VM has already had its
+        // workload quiesced (Apple's documented post-save_state state),
+        // and forcing it to Stopped invalidates the saved snapshot
+        // from VZ's restore_state perspective (VZErrorDomain:12
+        // "invalid argument" on next process's restore attempt).
+        // The OS reclaims file handles + VZ resources anyway when
+        // the process exits; no explicit cleanup needed for Paused.
+        if state.is_active() && state != VmState::Paused {
             tracing::warn!(state = %state, "VmHandle dropped while VM active, forcing hard stop");
             // Hard stop via the dispatch queue — safe because exec_sync
             // blocks until the queue drains, ensuring the VM is stopped
