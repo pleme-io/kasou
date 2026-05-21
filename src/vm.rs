@@ -345,10 +345,25 @@ impl VmHandle {
     ///
     /// The VM remains in Paused state after saving. The state file can be
     /// used later to restore the VM to this exact point.
+    ///
+    /// Durability: Apple's saveMachineStateToURL completion handler
+    /// fires when the write reaches the OS, but the file may still
+    /// live in the page cache. If the process exits and the cache is
+    /// flushed differently than the in-memory representation, the
+    /// next process's restore_state can fail with VZErrorDomain:12
+    /// "invalid argument". We explicitly fsync the file after the
+    /// completion handler returns so the on-disk bytes are the ones
+    /// Apple committed to.
     pub fn save_state(&self, path: &Path) -> Result<(), KasouError> {
         dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "save", |vm, url, block| {
             unsafe { (*vm).saveMachineStateToURL_completionHandler(&*url, block) };
         })?;
+        // Force-sync the saved file to durable storage. Without this,
+        // a fast process-exit can race the OS flush and the next
+        // restore_state sees a torn/partial snapshot file.
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) {
+            let _ = file.sync_all();
+        }
         // VM remains Paused after save; no state transition.
         self.emit(VmEventKind::SnapshotCreated { path: path.to_path_buf() });
         Ok(())
