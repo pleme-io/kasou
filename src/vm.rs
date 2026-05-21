@@ -183,8 +183,8 @@ fn dispatch_vz_op(
             let result = if error.is_null() {
                 Ok(())
             } else {
-                let desc = unsafe { (*error).localizedDescription() }.to_string();
-                Err(KasouError::OperationFailed(format!("{op_name} failed: {desc}")))
+                let chain = crate::util::ns_error_chain(unsafe { &*error });
+                Err(KasouError::OperationFailed(format!("{op_name} failed: {chain}")))
             };
             if let Some(tx) = tx.take() {
                 let _ = tx.send(result);
@@ -223,8 +223,8 @@ fn dispatch_vz_url_op(
             let result = if error.is_null() {
                 Ok(())
             } else {
-                let desc = unsafe { (*error).localizedDescription() }.to_string();
-                Err(KasouError::OperationFailed(format!("{op_name} failed: {desc}")))
+                let chain = crate::util::ns_error_chain(unsafe { &*error });
+                Err(KasouError::OperationFailed(format!("{op_name} failed: {chain}")))
             };
             if let Some(tx) = tx.take() {
                 let _ = tx.send(result);
@@ -359,8 +359,8 @@ impl VmHandle {
         self.queue.exec_async(move || {
             let vm_ptr = vm_addr as *const VZVirtualMachine;
             let result = unsafe { (*vm_ptr).requestStopWithError() }.map_err(|e| {
-                let desc = e.localizedDescription().to_string();
-                KasouError::OperationFailed(format!("request stop failed: {desc}"))
+                let chain = crate::util::ns_error_chain(&e);
+                KasouError::OperationFailed(format!("request stop failed: {chain}"))
             });
             let _ = tx.send(result);
         });

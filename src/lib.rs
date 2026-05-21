@@ -68,7 +68,7 @@ pub use types::{
 pub use event::{VmEvent, VmEventBus, VmEventKind};
 
 // Runtime types
-pub use error::KasouError;
+pub use error::{FrameworkError, KasouError};
 pub use vm::{VmHandle, VmState};
 
 // Utilities

@@ -140,10 +140,10 @@ pub(crate) fn setup_boot_loader(
                         )
                     }
                     .map_err(|e| {
+                        let chain = crate::util::ns_error_chain(&e);
                         KasouError::Framework(format!(
-                            "failed to create EFI variable store at {}: {}",
+                            "failed to create EFI variable store at {}: {chain}",
                             store_path.display(),
-                            e.localizedDescription()
                         ))
                     })?
                 };

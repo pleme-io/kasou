@@ -190,8 +190,8 @@ fn build_vz_config_inner(
     // Validate the complete configuration
     // SAFETY: validateWithError checks all VZ constraints and returns an error if invalid.
     unsafe { vz_config.validateWithError() }.map_err(|e| {
-        let desc = e.localizedDescription().to_string();
-        KasouError::Framework(format!("VM configuration validation failed: {desc}"))
+        let chain = crate::util::ns_error_chain(&e);
+        KasouError::Framework(format!("VM configuration validation failed: {chain}"))
     })?;
 
     tracing::debug!("VZ configuration validated successfully");

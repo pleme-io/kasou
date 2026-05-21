@@ -35,8 +35,8 @@ define_class!(
 
         #[unsafe(method(virtualMachine:didStopWithError:))]
         fn did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
-            let desc = error.localizedDescription().to_string();
-            tracing::error!(error = %desc, "VM stopped with error");
+            let chain = crate::util::ns_error_chain(error);
+            tracing::error!(error = %chain, "VM stopped with error");
             let _ = self.ivars().state_tx.send(VmState::Error);
         }
     }

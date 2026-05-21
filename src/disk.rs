@@ -5,7 +5,7 @@ use objc2_virtualization::{
     VZDiskImageSynchronizationMode, VZVirtioBlockDeviceConfiguration,
 };
 
-use crate::util::{ns_error_description, path_to_nsurl};
+use crate::util::{ns_error_chain, path_to_nsurl};
 use crate::KasouError;
 
 /// Configuration for a virtio block device backed by a disk image.
@@ -42,7 +42,7 @@ pub(crate) fn create_storage_device(
         KasouError::Framework(format!(
             "failed to create disk attachment for {}: {}",
             config.path.display(),
-            ns_error_description(&e)
+            ns_error_chain(&e)
         ))
     })?;
 

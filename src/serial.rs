@@ -2,7 +2,7 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_virtualization::{VZFileSerialPortAttachment, VZVirtioConsoleDeviceSerialPortConfiguration};
 
-use crate::util::{ns_error_description, path_to_nsurl};
+use crate::util::{ns_error_chain, path_to_nsurl};
 use crate::KasouError;
 
 /// Configuration for a serial console that logs to a file.
@@ -28,7 +28,7 @@ pub(crate) fn create_serial_port(
         KasouError::Framework(format!(
             "failed to create serial port attachment for {}: {}",
             config.log_path.display(),
-            ns_error_description(&e)
+            ns_error_chain(&e)
         ))
     })?;
 
