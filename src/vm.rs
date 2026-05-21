@@ -138,6 +138,15 @@ pub struct VmHandle {
     queue: DispatchRetained<DispatchQueue>,
     _delegate: Retained<VmDelegate>,
     state_rx: watch::Receiver<VmState>,
+    /// Authoritative state-change publisher. Delegate already holds a
+    /// clone for guest-initiated stop/error transitions; lifecycle
+    /// methods (`start`/`pause`/`resume`/`stop`/`save_state`/
+    /// `restore_state`) hold another so they can publish the
+    /// host-initiated transitions Apple never tells the delegate
+    /// about. Without this, `state()` stayed at `Stopped` indefinitely
+    /// after a successful `start` — the bug that broke the 2026-05-21
+    /// J cycle's snapshot-save path.
+    state_tx: Arc<watch::Sender<VmState>>,
     config: VmConfig,
     event_bus: Arc<VmEventBus>,
     created_at: std::time::Instant,
@@ -271,6 +280,7 @@ impl VmHandle {
             queue,
             _delegate: delegate,
             state_rx,
+            state_tx,
             config: vm_config,
             event_bus,
             created_at: std::time::Instant::now(),
@@ -287,7 +297,7 @@ impl VmHandle {
         dispatch_vz_op(&self.queue, self.vm_addr(), "start", |vm, block| {
             unsafe { (*vm).startWithCompletionHandler(block) };
         })?;
-        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Running });
+        self.transition_state(before, VmState::Running);
         Ok(())
     }
 
@@ -297,7 +307,7 @@ impl VmHandle {
         dispatch_vz_op(&self.queue, self.vm_addr(), "stop", |vm, block| {
             unsafe { (*vm).stopWithCompletionHandler(block) };
         })?;
-        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Stopped });
+        self.transition_state(before, VmState::Stopped);
         Ok(())
     }
 
@@ -310,7 +320,7 @@ impl VmHandle {
         dispatch_vz_op(&self.queue, self.vm_addr(), "pause", |vm, block| {
             unsafe { (*vm).pauseWithCompletionHandler(block) };
         })?;
-        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Paused });
+        self.transition_state(before, VmState::Paused);
         Ok(())
     }
 
@@ -320,7 +330,7 @@ impl VmHandle {
         dispatch_vz_op(&self.queue, self.vm_addr(), "resume", |vm, block| {
             unsafe { (*vm).resumeWithCompletionHandler(block) };
         })?;
-        self.emit(VmEventKind::StateChanged { from: before, to: VmState::Running });
+        self.transition_state(before, VmState::Running);
         Ok(())
     }
 
@@ -332,6 +342,7 @@ impl VmHandle {
         dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "save", |vm, url, block| {
             unsafe { (*vm).saveMachineStateToURL_completionHandler(&*url, block) };
         })?;
+        // VM remains Paused after save; no state transition.
         self.emit(VmEventKind::SnapshotCreated { path: path.to_path_buf() });
         Ok(())
     }
@@ -341,9 +352,16 @@ impl VmHandle {
     /// The VM must be in Stopped state. After restoring, the VM will be
     /// in Paused state (ready to resume).
     pub fn restore_state(&self, path: &Path) -> Result<(), KasouError> {
+        let before = self.state();
         dispatch_vz_url_op(&self.queue, self.vm_addr(), path, "restore", |vm, url, block| {
             unsafe { (*vm).restoreMachineStateFromURL_completionHandler(&*url, block) };
         })?;
+        // After restore_state Apple has the VM in Paused state (ready
+        // to resume) — record that so callers reading state() see
+        // reality. Without this, `is_running` queries from any other
+        // process (including the daemon's own snapshot-save path)
+        // see the initial Stopped value and refuse to act.
+        self.transition_state(before, VmState::Paused);
         self.emit(VmEventKind::SnapshotRestored { path: path.to_path_buf() });
         Ok(())
     }
@@ -438,6 +456,19 @@ impl VmHandle {
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
+    }
+
+    /// Publish a state transition to BOTH the watch channel (so
+    /// `state()` sees current reality) AND the event bus (so any
+    /// VmEventBus subscriber gets the transition). Two channels
+    /// because they serve different consumers: state_rx is for
+    /// point-in-time reads (`is_running`-style checks), event_bus is
+    /// for streaming history. Without this both would silently miss
+    /// host-initiated transitions — the VmDelegate only fires for
+    /// guest-initiated stops + error events.
+    fn transition_state(&self, from: VmState, to: VmState) {
+        let _ = self.state_tx.send(to);
+        self.emit(VmEventKind::StateChanged { from, to });
     }
 
     /// Emit a lifecycle event.
