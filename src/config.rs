@@ -1,10 +1,11 @@
 use objc2::rc::Retained;
-use objc2_foundation::NSArray;
+use objc2_foundation::{NSArray, NSData};
 use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZEntropyDeviceConfiguration,
-    VZGenericPlatformConfiguration, VZNetworkDeviceConfiguration,
-    VZSerialPortConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtualMachineConfiguration,
+    VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
+    VZNetworkDeviceConfiguration, VZSerialPortConfiguration,
+    VZStorageDeviceConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtualMachineConfiguration,
 };
 
 use crate::boot::{self, BootConfig};
@@ -39,6 +40,21 @@ pub struct VmConfig {
     pub serial: Option<SerialConfig>,
     /// Host directories to share with the guest via virtiofs.
     pub shared_dirs: Vec<SharedDirConfig>,
+
+    /// Optional path to persist the typed
+    /// `VZGenericMachineIdentifier` between runs. When `Some` and
+    /// the file exists, the identifier is restored from its
+    /// `dataRepresentation` bytes — required for snapshot-resume
+    /// to succeed (VZ rejects restore with a mismatched identifier).
+    /// When `Some` and the file is missing, a fresh identifier is
+    /// generated + written to the path before VM creation. When
+    /// `None`, the platform gets a process-lifetime identifier
+    /// (no save/restore support).
+    ///
+    /// Recommended location: `<vm_dir>/machine-identifier.bin`.
+    /// Persistence is fsync-anchored to survive crashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_identifier_path: Option<std::path::PathBuf>,
 }
 
 impl VmConfig {
@@ -130,6 +146,27 @@ fn build_vz_config_inner(
     // Platform: generic (Linux)
     // SAFETY: VZGenericPlatformConfiguration::new() creates a default platform.
     let platform = unsafe { VZGenericPlatformConfiguration::new() };
+
+    // Snapshot-resume fix — VZGenericMachineIdentifier persistence.
+    //
+    // VZ's restore-from-saved-state path rejects any VM whose
+    // platform `machineIdentifier` differs from the one that was
+    // active when the snapshot was taken. The previous code path
+    // implicitly let VZ generate a fresh identifier on every boot
+    // — so `save_state` worked but `restore_state` always failed
+    // with `VZErrorDomain` code `VZErrorRestoreVirtualMachineFailed`.
+    //
+    // Fix: optionally persist the identifier's wire form
+    // (`dataRepresentation`) to a typed path. On boot:
+    //   * If the file exists, deserialize via
+    //     `initWithDataRepresentation:` and reuse.
+    //   * Otherwise, take the platform's fresh identifier +
+    //     fsync-anchored write its bytes to the path.
+    if let Some(id_path) = &config.machine_identifier_path {
+        let identifier = load_or_create_machine_identifier(id_path, &platform)?;
+        // SAFETY: setMachineIdentifier copies + retains internally.
+        unsafe { platform.setMachineIdentifier(&identifier) };
+    }
     // SAFETY: setPlatform is valid with any VZPlatformConfiguration subclass.
     unsafe { vz_config.setPlatform(&platform) };
 
@@ -198,6 +235,87 @@ fn build_vz_config_inner(
     Ok(vz_config)
 }
 
+/// Load the typed machine identifier from `path` if it exists,
+/// otherwise capture the freshly-generated identifier from
+/// `platform` and persist its `dataRepresentation` bytes to
+/// `path` (fsync-anchored).
+///
+/// The fsync is intentional: a crash mid-persist would otherwise
+/// leave a zero-byte file that future restores can't deserialize,
+/// permanently bricking snapshot-resume.
+fn load_or_create_machine_identifier(
+    path: &std::path::Path,
+    platform: &VZGenericPlatformConfiguration,
+) -> Result<Retained<VZGenericMachineIdentifier>, KasouError> {
+    use std::io::Write;
+
+    if path.exists() {
+        let bytes = std::fs::read(path).map_err(|e| {
+            KasouError::Validation(format!(
+                "read machine identifier from {}: {e}",
+                path.display()
+            ))
+        })?;
+        // SAFETY: NSData::with_bytes copies the slice; the resulting
+        // NSData lives long enough for initWithDataRepresentation.
+        let nsdata = NSData::with_bytes(&bytes);
+        use objc2::AllocAnyThread;
+        let alloc = VZGenericMachineIdentifier::alloc();
+        let maybe = unsafe {
+            VZGenericMachineIdentifier::initWithDataRepresentation(alloc, &nsdata)
+        };
+        // initWithDataRepresentation: returns nil for malformed bytes.
+        return maybe.ok_or_else(|| {
+            KasouError::Validation(format!(
+                "machine identifier at {} is corrupt or wrong format",
+                path.display()
+            ))
+        });
+    }
+
+    // First boot: take the platform's auto-generated identifier
+    // + persist its dataRepresentation atomically + fsync.
+    // SAFETY: machineIdentifier returns the platform's current identifier.
+    let identifier = unsafe { platform.machineIdentifier() };
+    // SAFETY: dataRepresentation returns NSData bytes valid until drop.
+    let data = unsafe { identifier.dataRepresentation() };
+    let bytes_vec: Vec<u8> = data.to_vec();
+    let bytes_slice: &[u8] = &bytes_vec;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                KasouError::Validation(format!(
+                    "mkdir -p {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    // Atomic write — temp file + rename + fsync the parent dir for
+    // crash safety. Same pattern as save_state in vm.rs.
+    let tmp = path.with_extension("bin.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| {
+            KasouError::Validation(format!("create {}: {e}", tmp.display()))
+        })?;
+        f.write_all(bytes_slice).map_err(|e| {
+            KasouError::Validation(format!("write {}: {e}", tmp.display()))
+        })?;
+        f.sync_all().map_err(|e| {
+            KasouError::Validation(format!("fsync {}: {e}", tmp.display()))
+        })?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        KasouError::Validation(format!(
+            "rename {} → {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    Ok(identifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +339,7 @@ mod tests {
             network: NetworkConfig { mac_address: None },
             serial: None,
             shared_dirs: vec![],
+            machine_identifier_path: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("cpus"));
@@ -244,9 +363,71 @@ mod tests {
             network: NetworkConfig { mac_address: None },
             serial: None,
             shared_dirs: vec![],
+            machine_identifier_path: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("memory"));
+    }
+
+    #[test]
+    fn machine_identifier_round_trip() {
+        // First call: file doesn't exist → fresh identifier created
+        // + persisted. Second call: file exists → restored from disk.
+        // The two identifiers must produce byte-identical
+        // dataRepresentation (proof that persistence + restore is
+        // lossless across the VZ FFI boundary).
+        let tmp = std::env::temp_dir().join(format!(
+            "kasou-machine-id-test-{}.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let platform = unsafe { VZGenericPlatformConfiguration::new() };
+        let first = load_or_create_machine_identifier(&tmp, &platform).unwrap();
+        assert!(tmp.exists(), "first call should persist the identifier");
+        let first_bytes = unsafe { first.dataRepresentation() }.to_vec();
+
+        // Second call — should restore from the persisted file.
+        let platform2 = unsafe { VZGenericPlatformConfiguration::new() };
+        let second = load_or_create_machine_identifier(&tmp, &platform2).unwrap();
+        let second_bytes = unsafe { second.dataRepresentation() }.to_vec();
+
+        assert_eq!(
+            first_bytes, second_bytes,
+            "restored identifier must match the persisted one byte-for-byte"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn machine_identifier_rejects_corrupt_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kasou-corrupt-id-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"not a real machine identifier").unwrap();
+        let platform = unsafe { VZGenericPlatformConfiguration::new() };
+        let res = load_or_create_machine_identifier(&tmp, &platform);
+        assert!(
+            res.is_err(),
+            "corrupt identifier file should fail loudly, not silently regenerate"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn machine_identifier_creates_parent_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kasou-nested-{}-vmdir/machine-id.bin",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
+        let platform = unsafe { VZGenericPlatformConfiguration::new() };
+        let _id = load_or_create_machine_identifier(&tmp, &platform).unwrap();
+        assert!(tmp.exists());
+        let _ = std::fs::remove_dir_all(tmp.parent().unwrap());
     }
 
     #[test]
@@ -264,6 +445,7 @@ mod tests {
             network: NetworkConfig { mac_address: None },
             serial: None,
             shared_dirs: vec![],
+            machine_identifier_path: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("disk"));

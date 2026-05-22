@@ -45,6 +45,7 @@ fn main() {
             log_path: std::path::PathBuf::from("/tmp/kasou-minimal/console.log"),
         }),
         shared_dirs: vec![],
+        machine_identifier_path: None,
     };
 
     eprintln!("validating config...");

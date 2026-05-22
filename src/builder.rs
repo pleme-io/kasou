@@ -68,6 +68,7 @@ pub struct VmConfigBuilder {
     mac: Option<String>,
     serial: Option<SerialConfig>,
     shared_dirs: Vec<SharedDirConfig>,
+    machine_identifier_path: Option<std::path::PathBuf>,
 }
 
 impl VmConfigBuilder {
@@ -82,7 +83,21 @@ impl VmConfigBuilder {
             mac: None,
             serial: None,
             shared_dirs: Vec::new(),
+            machine_identifier_path: None,
         }
+    }
+
+    /// Persist the VZ generic machine identifier to a file so
+    /// snapshot save/restore round-trips successfully. Required
+    /// for any consumer that uses `kasou::VmHandle::save_state`
+    /// + `kasou::VmHandle::restore_state`.
+    #[must_use]
+    pub fn machine_identifier_path(
+        mut self,
+        path: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.machine_identifier_path = Some(path.into());
+        self
     }
 
     /// Set the number of virtual CPUs.
@@ -259,6 +274,7 @@ impl VmConfigBuilder {
             },
             serial: self.serial,
             shared_dirs: self.shared_dirs,
+            machine_identifier_path: self.machine_identifier_path,
         };
 
         config.validate()?;

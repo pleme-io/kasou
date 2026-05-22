@@ -18,6 +18,7 @@ block2 = "0.6"
 dispatch2 = "0.3"
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = { version = "0.3", features = [
+    "NSData",
     "NSError",
     "NSString",
     "NSURL",
@@ -47,6 +48,7 @@ objc2-virtualization = { version = "0.3", features = [
     "VZVirtualMachineDelegate",
     "VZDirectoryShare",
     "VZDirectorySharingDeviceConfiguration",
+    "VZGenericMachineIdentifier",
     "VZGenericPlatformConfiguration",
     "VZPlatformConfiguration",
     "VZVirtioEntropyDeviceConfiguration",
